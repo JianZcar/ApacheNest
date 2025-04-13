@@ -213,6 +213,11 @@ restart_php(){
 	start_php
 }
 
+restart_all() {
+	restart_apache
+	restart_php
+}
+
 start_all(){
 	if ! pgrep -af "$CONF_DIR/httpd.conf" > /dev/null; then 
 		start_apache
