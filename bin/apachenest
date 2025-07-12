@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 set -e
 
+TITLE="ApacheNest"
+AUTHORS="JianZCar and aceday"
+
 INSTALL_DIR="$HOME/Documents/.apachenest"
 WWW_DIR="$INSTALL_DIR/www"
 CONF_DIR="$INSTALL_DIR/conf"
 
-# Colors and emojis
 GREEN="\033[0;32m"
 BLUE="\033[0;34m"
 YELLOW="\033[1;33m"
@@ -82,6 +84,7 @@ install_php() {
 		echo -e "${CHECK} ${GREEN}Download complete!${NC}"
 	fi
 }
+
 
 setup_apache_php() {
   echo "php82" > $CONF_DIR/php-version.conf
@@ -181,12 +184,14 @@ start_apache(){
 	nix-portable nix-shell -p apacheHttpd --run "
 		httpd -f $CONF_DIR/httpd.conf &
 	"
+	clear
 }
 
 start_php(){
 	nix-portable nix-shell -p $PHP_VERSION  --run "
 		php-fpm -y $CONF_DIR/php-fpm.conf &
 	"
+	clear
 }
 
 stop_apache(){
@@ -194,6 +199,7 @@ stop_apache(){
 		pkill -f "$CONF_DIR/httpd.conf"
 		sleep 1
 	fi
+	clear
 }
 
 stop_php(){
@@ -201,6 +207,7 @@ stop_php(){
 		pkill -f "$CONF_DIR/php-fpm.conf"
 		sleep 1
 	fi
+	clear
 }
 
 restart_apache(){
@@ -225,23 +232,28 @@ start_all(){
 	if ! pgrep -af "$CONF_DIR/php-fpm.conf" > /dev/null; then 
 		start_php
 	fi
+	clear
 }
 
 stop_all(){
 	stop_apache
 	stop_php
+	clear
 }
 
 restart(){
 	restart_apache
 	restart_php
+	clear
 }
 
 all_menu(){
+	clear
 	local ACTIONS
-	
 	while true; do
 		remove_dblock
+		printf "\n${BLUE}${ROCKET} ${TITLE} ${ROCKET}${NC}\n"
+
 		ACTIONS=("Start" "Stop" "Restart" "Refresh")
 		
 		local SELECTED_ACTION=$(printf "%s\n" "${ACTIONS[@]}" | fzf --border --highlight-line --height=10% --layout=reverse --prompt="All > ")
@@ -253,15 +265,19 @@ all_menu(){
 			 	stop_all & spinner ;;
 			"Restart")
 				restart_all & spinner ;;
+			"Refresh")
+				refresh_menu ;;
 		esac
 	done
+	clear
 }
 
 apache_menu(){
 	local ACTIONS
-	
 	while true; do
+		clear
 		remove_dblock
+		printf "\n${BLUE}${ROCKET} ${TITLE} ${ROCKET}${NC}\n"
 		ACTIONS=($(if ! pgrep -af "$CONF_DIR/httpd.conf" > /dev/null; then 
 			echo Start
 		else
@@ -277,15 +293,19 @@ apache_menu(){
 			 	stop_apache & spinner ;;
 			"Restart")
 				restart_apache & spinner ;;
+			"Refresh")
+				refresh_menu ;;
 		esac
 	done
+	clear
 }
 
 php_menu(){
+	clear
 	local ACTIONS
-	
 	while true; do
 		remove_dblock
+		printf "\n${BLUE}${ROCKET} ${TITLE} ${ROCKET}${NC}\n"
 		ACTIONS=($(if ! pgrep -af "$CONF_DIR/php-fpm.conf" > /dev/null; then 
 			echo Start
 		else
@@ -301,17 +321,27 @@ php_menu(){
 			 	stop_php & spinner ;;
 			"Restart")
 				restart_php & spinner ;;
+			"Refresh")
+				refresh_menu ;;
 			"Change Version")
 				select_php ;;
 		esac
 	done
+	clear
+}
+
+# How about refreshing the main menu?
+refresh_menu() {
+	clear
 }
 
 main_menu(){
+	clear
 	local ACTIONS
-	ACTIONS=("All" "Apache" "PHP" "Refresh" "Settings")
+	ACTIONS=("All" "Apache" "PHP" "Refresh" "Settings" "About")
 	while true; do
 		remove_dblock
+		printf "\n${BLUE}${ROCKET} ${TITLE} ${ROCKET}${NC}\n"
 		local SELECTED_ACTION=$(printf "%s\n" "${ACTIONS[@]}" | fzf --border --highlight-line --height=10% --layout=reverse \
 		--preview-window=80%:wrap --preview='
 		SELECTED={}
@@ -356,11 +386,31 @@ main_menu(){
 			 	apache_menu ;;
 			"PHP")
 			 	php_menu ;;
+			"Refresh")
+				refresh_menu ;;
 			"Settings")
 				echo Settings ;;
+			"About")
+				about ;;
 		esac
 	done
+	clear
 }
+
+about() {
+	echo -e "\n${BLUE}${ROCKET} ${TITLE} ${ROCKET}${NC}"
+	echo -e "${YELLOW}Authors: ${GREEN} ${AUTHORS} ${NC}"
+
+	read -n 1 -s
+	clear
+}
+
+bye() {
+	echo -e "\nBye! ${SUCCESS} ${GREEN}Thank you for using ApacheNest!${NC}\n"
+	exit 0
+}
+
+trap bye SIGINT
 
 configure_env
 [[ ! -d $INSTALL_DIR ]] && setup_apachenest
