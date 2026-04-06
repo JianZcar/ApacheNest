@@ -4,475 +4,464 @@ set -e
 TITLE="ApacheNest"
 AUTHORS="JianZCar and aceday"
 
+# Paths:
 INSTALL_DIR="$HOME/Documents/.apachenest"
 WWW_DIR="$INSTALL_DIR/www"
 CONF_DIR="$INSTALL_DIR/conf"
+BIN_DIR="$INSTALL_DIR/bin"
+APACHE_DIR="$INSTALL_DIR/apache"
+APACHE_LOG_DIR="$APACHE_DIR/logs"
+PHP_FPM_LOG="$INSTALL_DIR/php-fpm.log"
+# PHP-FPM writes its own notices/errors to php-fpm.log via error_log. Its
+# stderr must go somewhere *else*, otherwise every line is logged twice.
+PHP_FPM_STDERR_LOG="$INSTALL_DIR/php-fpm-stderr.log"
+PHP_ERROR_LOG="$INSTALL_DIR/php-error.log"
+MYSQL_DIR="$INSTALL_DIR/mysql"
+MYSQL_SOCKET="$MYSQL_DIR/mysql.sock"
+MYSQL_LOG="$MYSQL_DIR/mysql.log"
+MYSQL_CLIENT_CNF="$MYSQL_DIR/.client.cnf"
+MYSQL_CLI_LOG="$INSTALL_DIR/mysql-cli.log"
+MAILHOG_DIR="$INSTALL_DIR/mailhog"
+MAILHOG_LOG="$MAILHOG_DIR/mailhog.log"
+SESSIONS_DIR="$INSTALL_DIR/sessions"
+NIX_LOCK="$INSTALL_DIR/.nix-portable/nix/var/nix/db/db.sqlite.lock"
+NIX_LOG="$INSTALL_DIR/nix.log"
 
+# Ports (single source of truth; referenced by generated configs and the UI):
+APACHE_PORT=8080
+PHP_FPM_PORT=9000
+PHP_FPM_LISTEN="127.0.0.1:$PHP_FPM_PORT"
+MYSQL_PORT=3306
+MAIL_SMTP_PORT=1025
+MAIL_UI_PORT=8025
+
+# Defaults:
+MYSQL_DEFAULT_PASSWORD="root"
+DEFAULT_PHP_VERSION="php82"
+
+# Output:
 GREEN="\033[0;32m"
 BLUE="\033[0;34m"
 YELLOW="\033[1;33m"
 RED="\033[0;31m"
 NC="\033[0m"
 
-# Default MySQL password
-MYSQL_DEFAULT_PASSWORD="root"
-CHECK="✔️"
-ERROR="❌"
-ROCKET="🚀"
-GEAR="⚙️"
-DOWNLOAD="📥"
-HOURGLASS="⏳"
-SUCCESS="🎉"
+CHECK="[OK]"
+ERROR="[FAIL]"
+ROCKET="[*]"
+GEAR="[#]"
+DOWNLOAD="[DL]"
+SUCCESS="[DONE]"
 
-# Loading spinner function
-spinner() {
-	local pid=$!
-	local delay=0.10
-	local spinstr='⠼⠹⠛⠏⠧⠶'
-	while [ "$(ps a | awk '{print $1}' | grep $pid)" ]; do
-		local char="${spinstr:0:1}"
-		spinstr="${spinstr:1}${char}"
-		printf " %s " "$char"
-		sleep $delay
-		printf "\r"
-	done
-	printf "\r"
+# Set while a temporary file lives in the web root, so SIGINT can clean it up.
+SCRATCH_PAGE=""
+
+# --- Output helpers ---
+
+step()   { echo -e "${GEAR} ${YELLOW}$*${NC}"; }
+ok()     { echo -e "${CHECK} ${GREEN}$*${NC}"; }
+info()   { echo -e "${BLUE}$*${NC}"; }
+warn()   { echo -e "${YELLOW}$*${NC}"; }
+fail()   { echo -e "${ERROR} ${RED}$*${NC}"; }
+# Destructive-action banner: alarming, but not a failure.
+danger() { echo -e "${RED}$*${NC}"; }
+
+pause() {
+	printf '\n'
+	read -r -n 1 -s -p "Press any key to continue..." || true
+	echo
 }
+
+# Spinner. Usage: spinner [pid] - defaults to the most recent background job.
+# Liveness is tested with `kill -0` so a missing pid cannot spin forever.
+# Output goes to stderr so it never contaminates captured stdout.
+spinner() {
+	local pid=${1:-$!}
+	local delay=0.10
+	local spinstr='|/-\'
+
+	if [[ -z $pid ]]; then
+		sleep 0.3
+		return 0
+	fi
+
+	while kill -0 "$pid" 2>/dev/null; do
+		printf " %s " "${spinstr:0:1}" >&2
+		spinstr="${spinstr:1}${spinstr:0:1}"
+		sleep "$delay"
+		printf "\r" >&2
+	done
+	printf "\r" >&2
+}
+
+# Run in the background with a spinner, then wait so output is not lost.
+run_with_spinner() {
+	local pid rc
+	"$@" &
+	pid=$!
+	spinner "$pid"
+	wait "$pid"
+	rc=$?
+	return $rc
+}
+
+# ===========================================================================
+# Service registry
+#
+# Detection is pid-file first, validated against that one process's cmdline.
+# Scanning the process table is not safe: `pgrep -f <substring>` matches this
+# program's own fzf UI, and `pgrep -x php-fpm` never matches because php-fpm
+# rewrites its process title.
+# ===========================================================================
+
+# service_binary <service> -> fallback process name. nixpkgs "mysql" is MariaDB.
+service_binary() {
+	case "$1" in
+		apache) echo "httpd" ;;
+		php)    echo "php-fpm" ;;
+		mysql)  echo "mariadbd" ;;
+		mail)   echo "MailHog" ;;
+		*)      return 1 ;;
+	esac
+}
+
+service_binary_alt() {
+	case "$1" in
+		mysql) echo "mysqld" ;;
+		*)     return 1 ;;
+	esac
+}
+
+# service_pid_file <service> -> pid file written by the daemon itself
+service_pid_file() {
+	case "$1" in
+		apache) echo "$APACHE_DIR/httpd.pid" ;;
+		php)    echo "$INSTALL_DIR/php-fpm.pid" ;;
+		mysql)  echo "$MYSQL_DIR/mysql.pid" ;;
+		mail)   echo "" ;;
+		*)      return 1 ;;
+	esac
+}
+
+# service_pid_expectation <service> -> substring that proves a pid is ours
+service_pid_expectation() {
+	case "$1" in
+		apache) echo "$CONF_DIR/httpd.conf" ;;
+		php)    echo "$CONF_DIR/php-fpm.conf" ;;
+		mysql)  echo "$MYSQL_DIR/my.cnf" ;;
+		mail)   echo "MailHog" ;;
+	esac
+}
+
+# service_label <service>
+service_label() {
+	case "$1" in
+		apache) echo "Apache" ;;
+		php)    echo "PHP" ;;
+		mysql)  echo "MySQL" ;;
+		mail)   echo "Mail" ;;
+		*)      echo "$1" ;;
+	esac
+}
+
+# Confirm a pid is our daemon by reading only that process's cmdline.
+service_pid_is_ours() {
+	local svc=$1 pid=$2 cmdline
+	cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || return 1
+	[[ $cmdline == *"$3"* ]]
+}
+
+# service_pids <service>
+service_pids() {
+	local svc=$1 pidfile pid binary
+
+	pidfile=$(service_pid_file "$svc") || return 2
+	if [[ -n $pidfile && -s $pidfile ]]; then
+		# php-fpm unlinks its own pid file as it exits, so it can disappear
+		# between the test above and the read. The whole group is silenced so
+		# that race cannot print a shell redirection error at the user.
+		pid=$( { tr -dc '0-9' < "$pidfile"; } 2>/dev/null ) || pid=""
+		if [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null &&
+			service_pid_is_ours "$svc" "$pid" "$(service_pid_expectation "$svc")"; then
+			printf '%s\n' "$pid"
+			return 0
+		fi
+	fi
+
+	binary=$(service_binary "$svc") || return 2
+	if [[ $svc == php ]]; then
+		# php-fpm's kernel name is unusable; match its rewritten title. No argv
+		# in this program contains that string, so there is no self-match.
+		pgrep -f 'php-fpm: master process' 2>/dev/null || true
+	elif binary=$(service_binary_alt "$svc") 2>/dev/null; then
+		pgrep -x "$binary" 2>/dev/null || true
+	fi
+	pgrep -x "$(service_binary "$svc")" 2>/dev/null || true
+}
+
+# service_is_running <service>
+service_is_running() {
+	local pids
+	pids=$(service_pids "$1") || return 2
+	[[ -n $pids ]]
+}
+
+# Pool workers inherit the listening socket, so they are signalled with the master.
+process_children() {
+	pgrep -P "$1" 2>/dev/null || true
+}
+
+# SIGTERM, then escalate to SIGKILL on the master *and its children*: killing a
+# master alone orphans its pool workers, which keep port 9000 bound and make the
+# next start fail with EADDRINUSE.
+service_stop() {
+	local svc=$1 pids master children m waited
+
+	if ! service_is_running "$svc"; then
+		return 0
+	fi
+
+	case "$svc" in
+		mysql) mysqladmin_shutdown || true ;;
+	esac
+
+	pids=$(service_pids "$svc")
+	[[ -n $pids ]] || return 0
+
+	# shellcheck disable=SC2086
+	kill $pids 2>/dev/null || true
+
+	waited=0
+	while [[ $waited -lt 20 ]] && service_is_running "$svc"; do
+		sleep 0.5
+		waited=$((waited + 1))
+	done
+	service_is_running "$svc" || return 0
+
+	warn "$(service_label "$svc") did not exit, force stopping..."
+	master=$(service_pids "$svc")
+	children=""
+	for m in $master; do
+		children+=" $(process_children "$m")"
+	done
+	# shellcheck disable=SC2086
+	kill -9 $children $master 2>/dev/null || true
+	sleep 1
+	return 0
+}
+
+# Is something listening on 127.0.0.1:<port>?
+port_listening() {
+	local port=$1
+	if command -v ss >/dev/null 2>&1; then
+		ss -ltn 2>/dev/null | awk -v pat=":$port\$" '$4 ~ pat { found = 1 } END { exit !found }'
+	else
+		(exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null || return 1
+		exec 3<&- 2>/dev/null || true
+		return 0
+	fi
+}
+
+# pids holding a listening socket on 127.0.0.1:<port>
+port_holder_pids() {
+	local port=$1
+	command -v ss >/dev/null 2>&1 || return 0
+	ss -ltnp 2>/dev/null |
+		awk -v pat=":$port\$" '$4 ~ pat' |
+		grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u
+}
+
+# Free a port held by leftover php-fpm workers. Never signals anything whose
+# cmdline is not php-fpm, so an unrelated listener is reported, not killed.
+reclaim_fpm_socket() {
+	local holders p
+	holders=$(port_holder_pids "$PHP_FPM_PORT")
+	[[ -n $holders ]] || return 0
+
+	for p in $holders; do
+		if tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q 'php-fpm'; then
+			warn "Reclaiming port $PHP_FPM_PORT from stale php-fpm (pid $p)"
+			kill -9 "$p" 2>/dev/null || true
+		else
+			warn "Port $PHP_FPM_PORT is held by pid $p, which is not php-fpm - leaving it alone"
+		fi
+	done
+	sleep 1
+}
+
+# --- Environment ---
 
 configure_env() {
 	export NP_LOCATION="$INSTALL_DIR"
-	export PATH="$PATH:$INSTALL_DIR/bin"
-	export NP_GIT="$(which git)"
-	if [[ -f $CONF_DIR/php-version.conf ]]; then
-		PHP_VERSION=$(<$CONF_DIR/php-version.conf)
+	export PATH="$PATH:$BIN_DIR"
+	export NP_GIT="$(command -v git || true)"
+	export APACHENEST_BIN
+	APACHENEST_BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+	if [[ -f "$CONF_DIR/php-version.conf" ]]; then
+		PHP_VERSION=$(<"$CONF_DIR/php-version.conf")
+	fi
+	PHP_VERSION=${PHP_VERSION:-$DEFAULT_PHP_VERSION}
+
+	# Needed by --status, which fzf runs in a child shell.
+	export INSTALL_DIR CONF_DIR APACHE_DIR APACHE_LOG_DIR
+	export PHP_FPM_LOG MYSQL_LOG MAILHOG_LOG APACHE_PORT
+}
+
+# nix's database lock is a *file*, so -d never matched it.
+remove_dblock() {
+	if [[ -e $NIX_LOCK ]]; then
+		echo -e "\n${YELLOW}DB lock found, removing...${NC}"
+		rm -rf "$NIX_LOCK"
+		ok "DB lock removed"
 	fi
 }
 
-remove_dblock() {
-	if [[ -d $INSTALL_DIR/.nix-portable/nix/var/nix/db/db.sqlite.lock ]]; then
-		echo -e "\n${YELLOW}DB Lock Found Removing...${NC}"
-		rm -rf $INSTALL_DIR/.nix-portable/nix/var/nix/db/db.sqlite.lock
-		echo -e "${CHECK} ${GREEN}DB Lock removed${NC}"
+require_commands() {
+	local missing=()
+	local cmd
+	for cmd in curl jq fzf; do
+		command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+	done
+	if [[ ${#missing[@]} -gt 0 ]]; then
+		fail "Missing required commands: ${missing[*]}"
+		echo "Install them and run ApacheNest again."
+		exit 1
 	fi
 }
+
+# Escape a value for embedding in a MySQL option file (single-quoted string).
+# Backslashes are dropped because MySQL treats them as escapes by default.
+my_cnf_escape() {
+	local s=${1//\\/}
+	printf "%s" "${s//\'/\'\'}"
+}
+
+# Escape a value for embedding in a SQL string literal under NO_BACKSLASH_ESCAPES.
+sql_escape() {
+	local s=${1//\\/}
+	printf "%s" "${s//\'/\'\'}"
+}
+
+# --- Nix Portable bootstrap ---
 
 setup_nix_portable() {
-	echo -e "\n${BLUE}${ROCKET} Installing Nix-Portable ${ROCKET}${NC}"
-	echo -e "${GEAR} ${YELLOW}Creating directory structure...${NC}"
-	mkdir -p "$INSTALL_DIR/bin"
-	mkdir -p "$WWW_DIR"
-	mkdir -p "$CONF_DIR"
-	mkdir -p "$INSTALL_DIR/apache"
-	mkdir -p "$INSTALL_DIR/apache/logs"
-	echo -e "${CHECK} ${GREEN}Directories created!${NC}"
+	step "Creating directory structure..."
+	mkdir -p "$BIN_DIR" "$WWW_DIR" "$CONF_DIR" "$APACHE_LOG_DIR" \
+		"$MYSQL_DIR" "$MAILHOG_DIR" "$SESSIONS_DIR"
+	ok "Directories created"
 
-	echo -e "\n${DOWNLOAD} ${YELLOW}Downloading nix-portable...${NC}"
-	curl -sL https://github.com/DavHau/nix-portable/releases/latest/download/nix-portable-$(uname -m) > $INSTALL_DIR/bin/nix-portable & spinner
-	chmod +x "$INSTALL_DIR/bin/nix-portable"
-	echo -e "${CHECK} ${GREEN}Download complete!${NC}"
-	echo -e "${SUCCESS} ${GREEN}Installation complete!${NC}"
+	if [[ -x "$BIN_DIR/nix-portable" ]]; then
+		ok "Nix-Portable already present, skipping download"
+		return 0
+	fi
+
+	info "\n${DOWNLOAD} ${YELLOW}Downloading Nix-Portable...${NC}"
+	run_with_spinner curl -fsSL \
+		"https://github.com/DavHau/nix-portable/releases/latest/download/nix-portable-$(uname -m)" \
+		-o "$BIN_DIR/nix-portable" || {
+		fail "Failed to download nix-portable"
+		exit 1
+	}
+	chmod +x "$BIN_DIR/nix-portable"
+	ok "Download complete"
+	ok "Nix-Portable installation complete"
 }
+
+nix_install_pkg() {
+	local pkg=$1 label=$2
+	if nix-portable nix path-info -f '<nixpkgs>' "$pkg" >/dev/null 2>&1; then
+		return 0
+	fi
+	info "${DOWNLOAD} ${YELLOW}Downloading $label...${NC}"
+	: > "$NIX_LOG"
+	if nix-portable nix-shell -p "$pkg" --run "" >"$NIX_LOG" 2>&1; then
+		ok "Download complete"
+	else
+		fail "Failed to install $label"
+		show_nix_log
+		return 1
+	fi
+}
+
+# Does an attribute exist in the nixpkgs nix-shell actually uses? `nix search
+# nixpkgs` queries a different revision (the flake) and would offer php84, which
+# the bundled channel cannot build.
+nix_attr_exists() {
+	nix-portable nix eval --impure --raw --expr \
+		"if builtins.hasAttr \"$1\" (import <nixpkgs> {}) then \"yes\" else \"no\"" 2>/dev/null |
+		grep -q '^yes$'
+}
+
+# PHP versions installable from the bundled channel.
+nix_available_php() {
+	nix-portable nix eval --impure --raw --expr \
+		'builtins.concatStringsSep "\n" (builtins.filter (n: builtins.match "php[0-9][0-9]" n != null) (builtins.attrNames (import <nixpkgs> {})))' \
+		2>/dev/null | sort -V
+}
+
+show_nix_log() {
+	if [[ -s $NIX_LOG ]]; then
+		echo
+		echo -e "${YELLOW}--- nix output ---${NC}"
+		tail -n 25 "$NIX_LOG"
+		echo -e "${YELLOW}--- end nix output (full log: $NIX_LOG) ---${NC}"
+	fi
+}
+
+# Run nix-shell with output captured instead of dumped on screen.
+run_nix() {
+	local pkg=$1
+	shift
+	: > "$NIX_LOG"
+	nix-portable nix-shell -p "$pkg" --run "$*" >"$NIX_LOG" 2>&1
+}
+
+# Poll until a service is up. limit is in half-seconds.
+wait_for_service() {
+	local svc=$1 limit=${2:-60} waited=0
+	while ! service_is_running "$svc"; do
+		sleep 0.5
+		waited=$((waited + 1))
+		[[ $waited -ge $limit ]] && return 1
+	done
+	return 0
+}
+
+report_start_failure() {
+	fail "$1"
+	show_nix_log
+}
+
+# --- Apache ---
 
 install_apache() {
-	if ! nix-portable nix path-info -f '<nixpkgs>' apacheHttpd.out >/dev/null 2>&1; then
-		echo -e "${DOWNLOAD} ${YELLOW}Downloading Apache...${NC}"
-		nix-portable nix-shell -p apacheHttpd --run "" 2>/dev/null & spinner
-		echo -e "${CHECK} ${GREEN}Download complete!${NC}"
-	fi
+	nix_install_pkg "apacheHttpd" "Apache"
 }
 
-install_php() {
-	if ! nix-portable nix path-info -f '<nixpkgs>' "$PHP_VERSION" >/dev/null 2>&1; then
-		echo -e "${DOWNLOAD} ${YELLOW}Downloading $PHP_VERSION...${NC}"
-		nix-portable nix-shell -p "$PHP_VERSION" --run "" 2>/dev/null & spinner
-		echo -e "${CHECK} ${GREEN}Download complete!${NC}"
-
-		echo "<?php phpinfo(); ?>" > "$WWW_DIR/index.php"
-	fi
+apache_path() {
+	nix-portable nix-shell -p apacheHttpd --run \
+		"echo \$(dirname \$(dirname \$(which httpd)))" 2>/dev/null || true
 }
 
-install_mysql() {
-	if ! nix-portable nix path-info -f '<nixpkgs>' mysql.out >/dev/null 2>&1; then
-		echo -e "${DOWNLOAD} ${YELLOW}Downloading MySQL...${NC}"
-		nix-portable nix-shell -p mysql --run "" 2>/dev/null & spinner
-		echo -e "${CHECK} ${GREEN}Download complete!${NC}"
-	fi
-}
-
-install_mailhog() {
-	if ! nix-portable nix path-info -f '<nixpkgs>' mailhog >/dev/null 2>&1; then
-		echo -e "${DOWNLOAD} ${YELLOW}Downloading MailHog...${NC}"
-		nix-portable nix-shell -p mailhog --run "" 2>/dev/null & spinner
-		echo -e "${CHECK} ${GREEN}Download complete!${NC}"
-	fi
-}
-
-config_mailhog() {
-	echo -e "${YELLOW}Setting up MailHog...${NC}"
-	
-	# Create MailHog directory
-	if [[ ! -d $INSTALL_DIR/mailhog ]]; then
-		mkdir -p "$INSTALL_DIR/mailhog"
-		echo -e "${CHECK} ${GREEN}MailHog directory created!${NC}"
-	fi
-	
-	# Create MailHog log file
-	if [[ ! -f $INSTALL_DIR/mailhog/mailhog.log ]]; then
-		touch "$INSTALL_DIR/mailhog/mailhog.log"
-		echo -e "${CHECK} ${GREEN}MailHog log file created!${NC}"
-	fi
-	
-	echo -e "${SUCCESS} ${GREEN}MailHog configuration complete!${NC}"
-	echo -e "${BLUE}SMTP Server: localhost:1025${NC}"
-	echo -e "${BLUE}Web UI: http://localhost:8025${NC}"
-}
-
-setup_mailhog() {
-	echo -e "${YELLOW}Installing MailHog ${NC}"
-	install_mailhog
-	config_mailhog
-}
-
-start_mailhog() {
-	config_mailhog
-	
-	if pgrep -af "MailHog" > /dev/null; then
-		echo -e "${YELLOW}MailHog is already running!${NC}"
-		return 0
-	fi
-	
-	echo -e "${YELLOW}Starting MailHog...${NC}"
-	nix-portable nix-shell -p mailhog --run "
-		MailHog > $INSTALL_DIR/mailhog/mailhog.log 2>&1 &
-	"
-	sleep 1
-	echo -e "${CHECK} ${GREEN}MailHog started!${NC}"
-	echo -e "${BLUE}SMTP Server: localhost:1025${NC}"
-	echo -e "${BLUE}Web UI: http://localhost:8025${NC}"
-	clear
-}
-
-stop_mailhog() {
-	echo -e "${YELLOW}Stopping MailHog...${NC}"
-	
-	if pgrep -af "MailHog" > /dev/null; then
-		pkill -f "MailHog" 2>/dev/null || true
-		sleep 1
-	fi
-	
-	echo -e "${CHECK} ${GREEN}MailHog stopped!${NC}"
-	clear
-}
-
-restart_mailhog() {
-	stop_mailhog
-	sleep 1
-	start_mailhog
-}
-
-config_php_mail() {
-	echo -e "${YELLOW}Configuring PHP to use MailHog...${NC}"
-	
-	# Create php.ini override for mail settings
-	cat > "$CONF_DIR/php-mail.ini" <<EOF
-[mail function]
-sendmail_path = "/usr/bin/env catchmail -smtp-addr localhost:1025"
-SMTP = localhost
-smtp_port = 1025
-EOF
-	
-	echo -e "${CHECK} ${GREEN}PHP mail configuration created!${NC}"
-	echo -e "${YELLOW}Note: Restart PHP-FPM for changes to take effect.${NC}"
-	read -n 1 -s -p "Press any key to continue..."
-}
-
-open_mailhog_ui() {
-	if ! pgrep -af "MailHog" > /dev/null; then
-		echo -e "${ERROR} ${RED}MailHog is not running! Please start MailHog first.${NC}"
-		read -n 1 -s -p "Press any key to continue..."
+setup_apache_config() {
+	local APACHE_PATH
+	APACHE_PATH=$(apache_path)
+	if [[ -z $APACHE_PATH ]]; then
+		fail "Could not locate the Apache installation"
 		return 1
 	fi
-	
-	echo -e "${BLUE}Opening MailHog Web UI...${NC}"
-	echo -e "${GREEN}URL: http://localhost:8025${NC}"
-	
-	# Try to open in browser
-	if command -v xdg-open &> /dev/null; then
-		xdg-open "http://localhost:8025" 2>/dev/null &
-	elif command -v open &> /dev/null; then
-		open "http://localhost:8025" 2>/dev/null &
-	else
-		echo -e "${YELLOW}Please open http://localhost:8025 in your browser.${NC}"
-	fi
-	read -n 1 -s -p "Press any key to continue..."
-}
 
-test_email() {
-	if ! pgrep -af "MailHog" > /dev/null; then
-		echo -e "${ERROR} ${RED}MailHog is not running! Please start MailHog first.${NC}"
-		read -n 1 -s -p "Press any key to continue..."
-		return 1
-	fi
-	
-	echo -e "${YELLOW}Sending test email...${NC}"
-	
-	# Create a simple test email using sendmail format
-	echo -e "Subject: Test Email from ApacheNest\nFrom: test@apachenest.local\nTo: user@example.com\n\nThis is a test email from ApacheNest MailHog.\nIf you see this in MailHog UI, email is working!" | \
-	nix-portable nix-shell -p mailhog --run "MailHog sendmail" 2>/dev/null || \
-	(
-		# Alternative: use nc/netcat to send directly to SMTP
-		{
-			echo "EHLO localhost"
-			sleep 0.2
-			echo "MAIL FROM:<test@apachenest.local>"
-			sleep 0.2
-			echo "RCPT TO:<user@example.com>"
-			sleep 0.2
-			echo "DATA"
-			sleep 0.2
-			echo "Subject: Test Email from ApacheNest"
-			echo "From: test@apachenest.local"
-			echo "To: user@example.com"
-			echo ""
-			echo "This is a test email from ApacheNest MailHog."
-			echo "If you see this in MailHog UI, email is working!"
-			echo "."
-			sleep 0.2
-			echo "QUIT"
-		} | nc localhost 1025 2>/dev/null
-	)
-	
-	echo -e "${SUCCESS} ${GREEN}Test email sent! Check MailHog UI at http://localhost:8025${NC}"
-	read -n 1 -s -p "Press any key to continue..."
-}
-
-config_mysql() {
-	echo -e "${YELLOW}Setting up MySQL...${NC}"
-	
-	# Create MySQL directories
-	if [[ ! -d $INSTALL_DIR/mysql ]]; then
-		mkdir -p "$INSTALL_DIR/mysql"
-		echo -e "${CHECK} ${GREEN}MySQL directory created!${NC}"
-	fi
-	
-	if [[ ! -d $INSTALL_DIR/mysql/data ]]; then
-		mkdir -p "$INSTALL_DIR/mysql/data"
-		echo -e "${CHECK} ${GREEN}MySQL data directory created!${NC}"
-	fi
-	
-	# Create MySQL configuration file
-	if [[ ! -f $INSTALL_DIR/mysql/my.cnf ]]; then
-		echo -e "${YELLOW}Creating MySQL config...${NC}"
-		cat > "$INSTALL_DIR/mysql/my.cnf" <<EOF
-[mysqld]
-datadir = $INSTALL_DIR/mysql/data
-socket = $INSTALL_DIR/mysql/mysql.sock
-user = $(whoami)
-bind-address = 127.0.0.1
-port = 3306
-skip-external-locking
-default_storage_engine = InnoDB
-innodb_file_per_table = 1
-innodb_log_file_size = 64M
-log-error = $INSTALL_DIR/mysql/mysql.log
-pid-file = $INSTALL_DIR/mysql/mysql.pid
-tmpdir = $INSTALL_DIR/mysql
-
-[mysqld_safe]
-log-error = $INSTALL_DIR/mysql/mysql.log
-pid-file = $INSTALL_DIR/mysql/mysql.pid
-
-[mysql]
-socket = $INSTALL_DIR/mysql/mysql.sock
-
-[client]
-socket = $INSTALL_DIR/mysql/mysql.sock
-EOF
-		echo -e "${CHECK} ${GREEN}MySQL config created!${NC}"
-	fi
-
-	# Create log file
-	if [[ ! -f $INSTALL_DIR/mysql/mysql.log ]]; then
-		touch "$INSTALL_DIR/mysql/mysql.log"
-		echo -e "${CHECK} ${GREEN}MySQL log file created!${NC}"
-	fi
-
-	# Create PID file
-	if [[ ! -f $INSTALL_DIR/mysql/mysql.pid ]]; then
-		touch "$INSTALL_DIR/mysql/mysql.pid"
-		echo -e "${CHECK} ${GREEN}MySQL PID file created!${NC}"
-	fi
-	
-	echo -e "${SUCCESS} ${GREEN}MySQL configuration complete!${NC}"
-}
-
-# Set initial MySQL root password
-set_mysql_initial_password() {
-	echo -e "${YELLOW}Setting initial MySQL root password...${NC}"
-	nix-portable nix-shell -p mysql --run "
-		mysqladmin --socket=$INSTALL_DIR/mysql/mysql.sock -u root password '$MYSQL_DEFAULT_PASSWORD'
-	" 2>/dev/null || true
-	echo -e "${CHECK} ${GREEN}MySQL root password set to default: $MYSQL_DEFAULT_PASSWORD${NC}"
-}
-
-# Change MySQL root password
-mysql_change_password() {
-	echo -e "${YELLOW}Change MySQL Root Password${NC}"
-	
-	if ! pgrep -af "mysqld" > /dev/null; then
-		echo -e "${ERROR} ${RED}MySQL server is not running! Please start MySQL first.${NC}"
-		read -n 1 -s -p "Press any key to continue..."
-		return 1
-	fi
-	
-	echo -e "${BLUE}Enter current password:${NC}"
-	read -s CURRENT_PASSWORD
-	echo
-	
-	echo -e "${BLUE}Enter new password:${NC}"
-	read -s NEW_PASSWORD
-	echo
-	
-	echo -e "${BLUE}Confirm new password:${NC}"
-	read -s CONFIRM_PASSWORD
-	echo
-	
-	if [[ "$NEW_PASSWORD" != "$CONFIRM_PASSWORD" ]]; then
-		echo -e "${ERROR} ${RED}Passwords do not match!${NC}"
-		read -n 1 -s -p "Press any key to continue..."
-		return 1
-	fi
-	
-	echo -e "${YELLOW}Changing password...${NC}"
-	nix-portable nix-shell -p mysql --run "
-		mysqladmin --socket=$INSTALL_DIR/mysql/mysql.sock -u root -p'$CURRENT_PASSWORD' password '$NEW_PASSWORD'
-	" 2>/dev/null
-	
-	if [[ $? -eq 0 ]]; then
-		echo -e "${SUCCESS} ${GREEN}Password changed successfully!${NC}"
-	else
-		echo -e "${ERROR} ${RED}Failed to change password. Check your current password.${NC}"
-	fi
-	read -n 1 -s -p "Press any key to continue..."
-}
-
-# Reset MySQL root password (when forgotten)
-mysql_reset_password() {
-	echo -e "${YELLOW}Reset MySQL Root Password${NC}"
-	echo -e "${RED}WARNING: This will stop MySQL, reset the root password to '$MYSQL_DEFAULT_PASSWORD', and restart MySQL.${NC}"
-	echo
-	echo -e "${YELLOW}Do you want to continue? (y/n)${NC}"
-	read -n 1 -r
-	echo
-	
-	if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-		echo -e "${YELLOW}Password reset cancelled.${NC}"
-		read -n 1 -s -p "Press any key to continue..."
-		return 0
-	fi
-	
-	echo -e "${YELLOW}Stopping MySQL...${NC}"
-	stop_mysql 2>/dev/null
-	
-	echo -e "${YELLOW}Starting MySQL in skip-grant-tables mode...${NC}"
-	nix-portable nix-shell -p mysql --run "
-		mysqld_safe --defaults-file=$INSTALL_DIR/mysql/my.cnf --skip-grant-tables &
-	" > /dev/null 2>&1 &
-	sleep 3
-	
-	echo -e "${YELLOW}Resetting root password...${NC}"
-	nix-portable nix-shell -p mysql --run "
-		mysql --socket=$INSTALL_DIR/mysql/mysql.sock -u root <<-EOSQL
-			FLUSH PRIVILEGES;
-			ALTER USER 'root'@'localhost' IDENTIFIED BY '$MYSQL_DEFAULT_PASSWORD';
-			FLUSH PRIVILEGES;
-		EOSQL
-	" 2>/dev/null
-	
-	echo -e "${YELLOW}Restarting MySQL normally...${NC}"
-	stop_mysql 2>/dev/null
-	sleep 2
-	start_mysql 2>/dev/null
-	
-	echo -e "${SUCCESS} ${GREEN}Password reset to: $MYSQL_DEFAULT_PASSWORD${NC}"
-	read -n 1 -s -p "Press any key to continue..."
-}
-
-# Reset MySQL database data (wipe and reinitialize)
-mysql_reset_data() {
-	echo -e "${RED}⚠️  WARNING: Reset MySQL Database Data ⚠️${NC}"
-	echo -e "${RED}This will DELETE ALL MySQL data and reinitialize the database!${NC}"
-	echo -e "${RED}All databases, tables, and data will be permanently lost!${NC}"
-	echo
-	echo -e "${YELLOW}Type 'RESET' to confirm:${NC}"
-	read CONFIRM
-	
-	if [[ "$CONFIRM" != "RESET" ]]; then
-		echo -e "${YELLOW}Reset cancelled.${NC}"
-		read -n 1 -s -p "Press any key to continue..."
-		return 0
-	fi
-	
-	echo -e "${YELLOW}Stopping MySQL...${NC}"
-	stop_mysql 2>/dev/null
-	sleep 2
-	
-	echo -e "${YELLOW}Removing MySQL data directory...${NC}"
-	rm -rf "$INSTALL_DIR/mysql/data"
-	mkdir -p "$INSTALL_DIR/mysql/data"
-	echo -e "${CHECK} ${GREEN}Data directory cleared!${NC}"
-	
-	echo -e "${YELLOW}Reinitializing MySQL database...${NC}"
-	nix-portable nix-shell -p mysql --run "
-		mysql_install_db --defaults-file=$INSTALL_DIR/mysql/my.cnf --datadir=$INSTALL_DIR/mysql/data --user=\$(whoami)
-	" 2>/dev/null
-	echo -e "${CHECK} ${GREEN}MySQL database reinitialized!${NC}"
-	
-	echo -e "${YELLOW}Starting MySQL...${NC}"
-	nix-portable nix-shell -p mysql --run "
-		mysqld_safe --defaults-file=$INSTALL_DIR/mysql/my.cnf &
-	" > /dev/null 2>&1 &
-	sleep 3
-	
-	echo -e "${YELLOW}Setting default root password...${NC}"
-	set_mysql_initial_password
-	
-	echo -e "${SUCCESS} ${GREEN}MySQL data reset complete! Default password: $MYSQL_DEFAULT_PASSWORD${NC}"
-	read -n 1 -s -p "Press any key to continue..."
-}
-
-setup_apache_php() {
-  echo "php82" > $CONF_DIR/php-version.conf
- 	PHP_VERSION=$(<$CONF_DIR/php-version.conf)
-  install_apache
-  install_php
-}
-
-setup_configs() {
-	APACHE_PATH=$(nix-portable nix-shell -p apacheHttpd --run "echo \$(dirname \$(dirname \$(which httpd)))" 2>/dev/null)
-	echo -e "\n${GEAR} ${YELLOW}Setting up ApacheNest configs...${NC}"
-	
-	echo -e "${YELLOW}Creating PHP-FPM config...${NC}"
-	cat > "$CONF_DIR/php-fpm.conf" <<EOF
-[global]
-error_log = $INSTALL_DIR/php-fpm.log
-
-[www]
-listen = 127.0.0.1:9000
-listen.allowed_clients = 127.0.0.1
-pm = dynamic
-pm.max_children = 5
-pm.start_servers = 2
-pm.min_spare_servers = 1
-pm.max_spare_servers = 3
-chdir = /
-EOF
-
-	echo -e "${YELLOW}Creating Apache config...${NC}"
+	step "Creating Apache config..."
 	cat > "$CONF_DIR/httpd.conf" <<EOF
 ServerName 127.0.0.1
-ServerRoot "$INSTALL_DIR/apache"
-Listen 8080
+ServerRoot "$APACHE_DIR"
+Listen $APACHE_PORT
+
+PidFile "$APACHE_DIR/httpd.pid"
+ErrorLog "$APACHE_LOG_DIR/error_log"
+CustomLog "$APACHE_LOG_DIR/access_log" common
+
 LoadModule mpm_event_module $APACHE_PATH/modules/mod_mpm_event.so
 LoadModule proxy_module $APACHE_PATH/modules/mod_proxy.so
 LoadModule proxy_fcgi_module $APACHE_PATH/modules/mod_proxy_fcgi.so
@@ -480,6 +469,10 @@ LoadModule dir_module $APACHE_PATH/modules/mod_dir.so
 LoadModule mime_module $APACHE_PATH/modules/mod_mime.so
 LoadModule authz_core_module $APACHE_PATH/modules/mod_authz_core.so
 LoadModule unixd_module $APACHE_PATH/modules/mod_unixd.so
+LoadModule log_config_module $APACHE_PATH/modules/mod_log_config.so
+LoadModule unixd_module $APACHE_PATH/modules/mod_unixd.so
+
+TypesConfig $APACHE_PATH/conf/mime.types
 
 DocumentRoot "$WWW_DIR"
 <Directory "$WWW_DIR">
@@ -489,159 +482,79 @@ DocumentRoot "$WWW_DIR"
 DirectoryIndex index.php index.html
 
 <FilesMatch \.php$>
-		SetHandler "proxy:fcgi://127.0.0.1:9000"
+		SetHandler "proxy:fcgi://$PHP_FPM_LISTEN"
 </FilesMatch>
-
-TypesConfig $APACHE_PATH/conf/mime.types
 EOF
-	echo -e "${SUCCESS} ${GREEN}ApacheNest config ready!${NC}\n"
+	ok "Apache config ready"
+
+	write_php_ini
+	setup_php_config
 }
 
-setup_mysql() {
-	echo -e "${YELLOW}Installing MySQL ${NC}"
-	install_mysql
-	config_mysql
-}
-
-setup_apachenest(){
-	setup_nix_portable
-	setup_apache_php
-	setup_configs
-
-	setup_mysql
-	setup_mailhog
-}
-
-select_php() {
-	stop_php
-  local CURRENT_VERSION=$PHP_VERSION
-  [[ -f php-version.conf ]] && CURRENT_VERSION=$(<php-version.conf)
-  
-	TMP_OUT=$(mktemp)
-	(
-		nix-portable nix search nixpkgs "php-with-extensions" \
-		  --exclude "apacheHttpdPackages" --json 2>/dev/null | \
-		  jq -r 'keys[] | select(test("php8[1-4]$")) | sub(".*\\."; "")' \
-		  > "$TMP_OUT"
-	) &
-	CMD_PID=$!
-	spinner "$CMD_PID"
-	PHP_VERSIONS=$(<"$TMP_OUT")
-	rm "$TMP_OUT"
-
-  local SORTED_VERSIONS
-  SORTED_VERSIONS=$(
-    printf "%s\n" $CURRENT_VERSION $PHP_VERSIONS \
-      | awk '!seen[$0]++'
-  )
-
- 
-  local SELECTED_VERSION=$(printf "%s\n" $SORTED_VERSIONS | fzf --border --highlight-line --height=10% --layout=reverse --header-lines=1 --prompt="Select PHP version > ")
-	[[ -z $SELECTED_VERSION ]] && return
-	PHP_VERSION=$SELECTED_VERSION
-  echo "$SELECTED_VERSION" > $CONF_DIR/php-version.conf
-  echo -e "${CHECK} ${GREEN}PHP version selected!${NC}"
-  install_php
-}
-
-# Show current PHP version and path info
-php_info() {
-	echo -e "${BLUE}=== PHP Information ===${NC}\n"
-	echo -e "${YELLOW}Current Version:${NC} $PHP_VERSION"
-	echo
-	
-	nix-portable nix-shell -p $PHP_VERSION --run "
-		echo -e '${YELLOW}PHP Version Details:${NC}'
-		php -v
-		echo
-		echo -e '${YELLOW}PHP Binary Path:${NC}'
-		which php
-		echo
-		echo -e '${YELLOW}PHP-FPM Binary Path:${NC}'
-		which php-fpm
-		echo
-		echo -e '${YELLOW}PHP Configuration File:${NC}'
-		php --ini | head -5
-	" 2>/dev/null
-	
-	echo
-	read -n 1 -s -p "Press any key to continue..."
-}
-
-# List installed PHP extensions
-php_extensions() {
-	echo -e "${BLUE}=== PHP Extensions ===${NC}\n"
-	echo -e "${YELLOW}Installed extensions for $PHP_VERSION:${NC}\n"
-	
-	nix-portable nix-shell -p $PHP_VERSION --run "
-		php -m
-	" 2>/dev/null | column
-	
-	echo
-	read -n 1 -s -p "Press any key to continue..."
-}
-
-# View phpinfo() in browser
-php_phpinfo() {
-	echo -e "${YELLOW}Creating phpinfo page...${NC}"
-	
-	# Create phpinfo file
-	echo '<?php phpinfo(); ?>' > "$WWW_DIR/phpinfo.php"
-	echo -e "${CHECK} ${GREEN}phpinfo.php created in $WWW_DIR${NC}"
-	
-	if ! pgrep -af "$CONF_DIR/httpd.conf" > /dev/null || ! pgrep -af "$CONF_DIR/php-fpm.conf" > /dev/null; then
-		echo -e "${YELLOW}Apache or PHP-FPM is not running.${NC}"
-		echo -e "${YELLOW}Start both services to view phpinfo in browser.${NC}"
-	else
-		echo -e "${BLUE}Opening phpinfo in browser...${NC}"
-		echo -e "${GREEN}URL: http://localhost:8080/phpinfo.php${NC}"
-		
-		if command -v xdg-open &> /dev/null; then
-			xdg-open "http://localhost:8080/phpinfo.php" 2>/dev/null &
-		elif command -v open &> /dev/null; then
-			open "http://localhost:8080/phpinfo.php" 2>/dev/null &
-		fi
+start_apache() {
+	if service_is_running apache; then
+		warn "Apache is already running"
+		return 0
 	fi
-	
-	read -n 1 -s -p "Press any key to continue..."
+
+	step "Starting Apache..."
+	mkdir -p "$APACHE_LOG_DIR"
+	run_nix apacheHttpd "httpd -f '$CONF_DIR/httpd.conf' >> '$APACHE_LOG_DIR/stdout.log' 2>&1 &" || true
+
+	if wait_for_service apache 40; then
+		ok "Apache started on http://localhost:$APACHE_PORT"
+	else
+		report_start_failure "Apache failed to start - see $APACHE_LOG_DIR/error_log"
+		[[ -s "$APACHE_LOG_DIR/error_log" ]] && tail -n 15 "$APACHE_LOG_DIR/error_log"
+		return 1
+	fi
 }
 
-# Edit PHP configuration
-php_edit_config() {
-	echo -e "${BLUE}=== PHP Configuration ===${NC}\n"
-	
-	# Create custom php.ini if not exists
-	if [[ ! -f $CONF_DIR/php.ini ]]; then
-		echo -e "${YELLOW}Creating custom php.ini...${NC}"
-		cat > "$CONF_DIR/php.ini" <<EOF
-; ApacheNest Custom PHP Configuration
-; Add your PHP settings here
+stop_apache() {
+	if ! service_is_running apache; then
+		warn "Apache is not running"
+		return 0
+	fi
+	step "Stopping Apache..."
+	service_stop apache
+	rm -f "$APACHE_DIR/httpd.pid"
+	ok "Apache stopped"
+}
+
+restart_apache() {
+	stop_apache
+	sleep 1
+	start_apache
+}
+
+# --- PHP ---
+
+install_php() {
+	if ! nix_attr_exists "$PHP_VERSION"; then
+		report_start_failure "PHP $PHP_VERSION is not available in this nixpkgs"
+		return 1
+	fi
+	nix_install_pkg "$PHP_VERSION" "$PHP_VERSION"
+}
+
+write_php_ini() {
+	cat > "$CONF_DIR/php.ini" <<EOF
+; ApacheNest PHP configuration
+; This file is loaded by PHP-FPM via "-c $CONF_DIR".
+; Restart PHP-FPM after editing.
 
 [PHP]
-; Maximum execution time of each script, in seconds
 max_execution_time = 300
-
-; Maximum amount of memory a script may consume
 memory_limit = 256M
-
-; Maximum size of POST data that PHP will accept
 post_max_size = 64M
-
-; Maximum allowed size for uploaded files
 upload_max_filesize = 64M
-
-; Maximum number of files that can be uploaded via a single request
 max_file_uploads = 20
-
-; Default timezone
 date.timezone = UTC
-
-; Error reporting
 error_reporting = E_ALL
 display_errors = On
 display_startup_errors = On
 log_errors = On
-error_log = $INSTALL_DIR/php-error.log
+error_log = "$PHP_ERROR_LOG"
 
 [opcache]
 opcache.enable = 1
@@ -652,589 +565,1245 @@ opcache.validate_timestamps = 1
 opcache.revalidate_freq = 2
 
 [Session]
-session.save_path = $INSTALL_DIR/sessions
+session.save_path = "$SESSIONS_DIR"
 
 [mail function]
-; For MailHog
+sendmail_path = "$BIN_DIR/mailhog-sendmail"
 SMTP = localhost
-smtp_port = 1025
+smtp_port = $MAIL_SMTP_PORT
 EOF
-		
-		# Create sessions directory
-		mkdir -p "$INSTALL_DIR/sessions"
-		echo -e "${CHECK} ${GREEN}php.ini created!${NC}"
+	ok "php.ini written to $CONF_DIR/php.ini"
+}
+
+setup_php_config() {
+	step "Creating PHP-FPM config..."
+	cat > "$CONF_DIR/php-fpm.conf" <<EOF
+[global]
+error_log = $PHP_FPM_LOG
+pid = $INSTALL_DIR/php-fpm.pid
+
+[www]
+listen = $PHP_FPM_LISTEN
+listen.allowed_clients = 127.0.0.1
+pm = dynamic
+pm.max_children = 5
+pm.start_servers = 2
+pm.min_spare_servers = 1
+pm.max_spare_servers = 3
+chdir = /
+php_admin_value[error_log] = $PHP_ERROR_LOG
+php_admin_flag[log_errors] = on
+EOF
+	ok "PHP-FPM config ready"
+}
+
+start_php() {
+	if service_is_running php; then
+		warn "PHP-FPM is already running"
+		return 0
 	fi
-	
-	echo -e "${YELLOW}PHP Configuration File: $CONF_DIR/php.ini${NC}\n"
-	
-	# Show current settings
-	echo -e "${BLUE}Current Settings:${NC}"
-	cat "$CONF_DIR/php.ini" | grep -v "^;" | grep -v "^$" | head -20
-	echo -e "\n...(truncated)\n"
-	
-	echo -e "${YELLOW}Options:${NC}"
-	echo "1) Edit php.ini with nano"
-	echo "2) Edit php.ini with vim"
-	echo "3) View full php.ini"
-	echo "4) Reset to defaults"
-	echo "5) Back"
-	echo
-	read -p "Select option: " OPTION
-	
-	case $OPTION in
-		1)
-			nano "$CONF_DIR/php.ini" ;;
-		2)
-			vim "$CONF_DIR/php.ini" ;;
-		3)
-			less "$CONF_DIR/php.ini" ;;
-		4)
-			rm -f "$CONF_DIR/php.ini"
-			echo -e "${CHECK} ${GREEN}php.ini reset. Will be recreated with defaults.${NC}"
-			php_edit_config ;;
-		*)
-			return ;;
-	esac
-	
-	echo -e "\n${YELLOW}Note: Restart PHP-FPM for changes to take effect.${NC}"
-	read -n 1 -s -p "Press any key to continue..."
-}
 
-# View PHP logs
-php_logs() {
-	echo -e "${BLUE}=== PHP Logs ===${NC}\n"
-	
-	echo -e "${YELLOW}Select log to view:${NC}"
-	echo "1) PHP-FPM Log ($INSTALL_DIR/php-fpm.log)"
-	echo "2) PHP Error Log ($INSTALL_DIR/php-error.log)"
-	echo "3) Tail PHP-FPM Log (live)"
-	echo "4) Clear all PHP logs"
-	echo "5) Back"
-	echo
-	read -p "Select option: " OPTION
-	
-	case $OPTION in
-		1)
-			if [[ -f $INSTALL_DIR/php-fpm.log ]]; then
-				less "$INSTALL_DIR/php-fpm.log"
-			else
-				echo -e "${YELLOW}No PHP-FPM log file found.${NC}"
-				read -n 1 -s -p "Press any key to continue..."
-			fi ;;
-		2)
-			if [[ -f $INSTALL_DIR/php-error.log ]]; then
-				less "$INSTALL_DIR/php-error.log"
-			else
-				echo -e "${YELLOW}No PHP error log file found.${NC}"
-				read -n 1 -s -p "Press any key to continue..."
-			fi ;;
-		3)
-			echo -e "${YELLOW}Tailing PHP-FPM log (Ctrl+C to exit)...${NC}\n"
-			tail -f "$INSTALL_DIR/php-fpm.log" 2>/dev/null || echo "Log file not found." ;;
-		4)
-			echo -e "${YELLOW}Clearing PHP logs...${NC}"
-			> "$INSTALL_DIR/php-fpm.log" 2>/dev/null
-			> "$INSTALL_DIR/php-error.log" 2>/dev/null
-			echo -e "${CHECK} ${GREEN}PHP logs cleared!${NC}"
-			read -n 1 -s -p "Press any key to continue..." ;;
-		*)
-			return ;;
-	esac
-}
-
-# Clear OPcache
-php_clear_opcache() {
-	if ! pgrep -af "$CONF_DIR/php-fpm.conf" > /dev/null; then
-		echo -e "${ERROR} ${RED}PHP-FPM is not running! Please start PHP first.${NC}"
-		read -n 1 -s -p "Press any key to continue..."
+	if ! nix_attr_exists "$PHP_VERSION"; then
+		report_start_failure "PHP $PHP_VERSION is not available in this nixpkgs"
 		return 1
 	fi
-	
-	echo -e "${YELLOW}Clearing OPcache...${NC}"
-	
-	# Create a temporary script to clear opcache
-	cat > "$WWW_DIR/opcache_clear.php" <<'EOF'
-<?php
-if (function_exists('opcache_reset')) {
-    opcache_reset();
-    echo "OPcache cleared successfully!";
-} else {
-    echo "OPcache is not available.";
-}
-?>
-EOF
-	
-	# Call the script
-	curl -s "http://localhost:8080/opcache_clear.php" 2>/dev/null || echo "Could not connect to server"
-	echo
-	
-	# Remove the temporary script
-	rm -f "$WWW_DIR/opcache_clear.php"
-	
-	echo -e "${CHECK} ${GREEN}OPcache clear attempted!${NC}"
-	read -n 1 -s -p "Press any key to continue..."
-}
 
-# PHP test script
-php_test() {
-	echo -e "${YELLOW}Running PHP test...${NC}\n"
-	
-	nix-portable nix-shell -p $PHP_VERSION --run "
-		echo '=== PHP Syntax Check ==='
-		php -v
-		echo
-		echo '=== Testing PHP execution ==='
-		php -r 'echo \"PHP is working! Current time: \" . date(\"Y-m-d H:i:s\") . \"\\n\";'
-		echo
-		echo '=== Checking common extensions ==='
-		php -r '
-			\$extensions = [\"pdo\", \"mysqli\", \"json\", \"mbstring\", \"curl\", \"openssl\", \"zip\", \"gd\"];
-			foreach (\$extensions as \$ext) {
-				\$status = extension_loaded(\$ext) ? \"✓\" : \"✗\";
-				echo \"  \$status \$ext\\n\";
-			}
-		'
-	" 2>/dev/null
-	
-	echo
-	read -n 1 -s -p "Press any key to continue..."
-}
-
-start_apache(){
-	nix-portable nix-shell -p apacheHttpd --run "
-		httpd -f $CONF_DIR/httpd.conf &
-	"
-	clear
-}
-
-start_php(){
-	nix-portable nix-shell -p $PHP_VERSION  --run "
-		php-fpm -y $CONF_DIR/php-fpm.conf &
-	"
-	clear
-}
-
-stop_apache(){
-	if pgrep -af "$CONF_DIR/httpd.conf" > /dev/null; then 
-		pkill -f "$CONF_DIR/httpd.conf"
-		sleep 1
+	# A leftover worker can still own port 9000 and surface as EADDRINUSE.
+	if port_listening "$PHP_FPM_PORT"; then
+		warn "Port $PHP_FPM_PORT is already bound"
+		reclaim_fpm_socket
+		if port_listening "$PHP_FPM_PORT"; then
+			report_start_failure "Port $PHP_FPM_PORT is still held by pid(s): $(port_holder_pids "$PHP_FPM_PORT" | tr '\n' ' ')"
+			return 1
+		fi
 	fi
-	clear
+
+	step "Starting PHP-FPM ($PHP_VERSION)..."
+	# -c makes PHP-FPM load $CONF_DIR/php.ini. Without it every php.ini edit
+	# was silently discarded. stderr is kept separate from error_log so each
+	# message is not written twice.
+	run_nix "$PHP_VERSION" \
+		"php-fpm -y '$CONF_DIR/php-fpm.conf' -c '$CONF_DIR' >> '$PHP_FPM_STDERR_LOG' 2>&1 &" || true
+
+	# Allow generous time: the first run of a version has to build/enter the
+	# nix sandbox before php-fpm itself appears.
+	if wait_for_service php 120; then
+		ok "PHP-FPM started (pid $(service_pids php | head -1))"
+	else
+		report_start_failure "PHP-FPM failed to start"
+		[[ -s $PHP_FPM_LOG ]] && { echo -e "${YELLOW}--- php-fpm.log ---${NC}"; tail -n 15 "$PHP_FPM_LOG"; }
+		[[ -s $PHP_FPM_STDERR_LOG ]] && { echo -e "${YELLOW}--- php-fpm stderr ---${NC}"; tail -n 15 "$PHP_FPM_STDERR_LOG"; }
+		return 1
+	fi
 }
 
-stop_php(){
-	if pgrep -af "$CONF_DIR/php-fpm.conf" > /dev/null; then 
-		pkill -f "$CONF_DIR/php-fpm.conf"
-		sleep 1
+stop_php() {
+	if ! service_is_running php && ! port_listening "$PHP_FPM_PORT"; then
+		warn "PHP-FPM is not running"
+		return 0
 	fi
-	clear
+	step "Stopping PHP-FPM..."
+	service_stop php
+	rm -f "$INSTALL_DIR/php-fpm.pid"
+	# Any worker that outlived the master still owns the listening socket.
+	port_listening "$PHP_FPM_PORT" && reclaim_fpm_socket
+	ok "PHP-FPM stopped"
 }
 
-start_mysql(){
-	# Ensure MySQL is configured first
-	config_mysql
-	
-	local FIRST_INIT=false
-	
-	# Initialize database if not already done
-	if [[ ! -f $INSTALL_DIR/mysql/data/mysql/db.opt ]]; then
-		echo -e "${YELLOW}Initializing MySQL database...${NC}"
-		nix-portable nix-shell -p mysql --run "
-			mysql_install_db --defaults-file=$INSTALL_DIR/mysql/my.cnf --datadir=$INSTALL_DIR/mysql/data --user=\$(whoami)
-		" 2>/dev/null
-		echo -e "${CHECK} ${GREEN}MySQL database initialized!${NC}"
-		FIRST_INIT=true
-	fi
-	
-	MYSQLD_LOG="$INSTALL_DIR/mysql/mysql.log"
-	echo -e "${YELLOW}Starting MySQL...${NC}"
-	nix-portable nix-shell -p mysql --run "
-		mysqld_safe --defaults-file=$INSTALL_DIR/mysql/my.cnf &
-	" > "$MYSQLD_LOG" 2>&1 &
-	sleep 2
-	echo -e "${CHECK} ${GREEN}MySQL started!${NC}"
-	
-	# Set default password on first initialization
-	if [[ "$FIRST_INIT" == true ]]; then
-		sleep 1
-		set_mysql_initial_password
-	fi
-	clear
-}
-
-stop_mysql(){
-	echo -e "${YELLOW}Stopping MySQL...${NC}"
-	
-	# Try graceful shutdown first using mysqladmin
-	if pgrep -af "mysqld" > /dev/null; then
-		nix-portable nix-shell -p mysql --run "
-			mysqladmin --socket=$INSTALL_DIR/mysql/mysql.sock shutdown
-		" 2>/dev/null || true
-		sleep 2
-	fi
-	
-	# Force kill if still running
-	if pgrep -af "mysqld" > /dev/null; then 
-		echo -e "${YELLOW}Force stopping MySQL processes...${NC}"
-		pkill -f "mysqld_safe" 2>/dev/null || true
-		pkill -f "mysqld" 2>/dev/null || true
-		sleep 2
-	fi
-	
-	# Clean up PID file
-	if [[ -f $INSTALL_DIR/mysql/mysql.pid ]]; then
-		rm -f "$INSTALL_DIR/mysql/mysql.pid"
-	fi
-	
-	echo -e "${CHECK} ${GREEN}MySQL stopped!${NC}"
-	clear
-}
-
-restart_apache(){
-	stop_apache && sleep 1
-	start_apache
-}
-
-restart_php(){
-	stop_php && sleep 1
+restart_php() {
+	stop_php
+	sleep 1
 	start_php
 }
 
+select_php() {
+	local current=$PHP_VERSION
+	if [[ -f "$CONF_DIR/php-version.conf" ]]; then
+		current=$(<"$CONF_DIR/php-version.conf")
+	fi
+
+	local was_running=false
+	service_is_running php && was_running=true
+
+	step "Querying available PHP versions..."
+	# From the bundled channel, so every option offered can actually be built.
+	local versions selected
+	versions=$(run_with_spinner nix_available_php | sort -u)
+	[[ -z $versions ]] && versions=$current
+	# Keep the current version selectable even if the query lagged.
+	versions=$(printf "%s\n%s\n" "$current" "$versions" | awk 'NF && !seen[$0]++' | sort -V)
+
+	selected=$(printf "%s\n" "$versions" |
+		fzf --border --highlight-line --height=10% --layout=reverse \
+			--prompt="Select PHP version > ") || true
+
+	[[ -z $selected ]] && { warn "Version unchanged"; return 0; }
+	[[ $selected == "$current" ]] && { warn "Already on $selected"; return 0; }
+
+	if ! nix_attr_exists "$selected"; then
+		report_start_failure "PHP $selected is not available in this nixpkgs"
+		return 1
+	fi
+
+	stop_php
+	PHP_VERSION=$selected
+	install_php || {
+		# Roll back rather than leaving a version recorded that cannot run.
+		PHP_VERSION=$current
+		echo "$PHP_VERSION" > "$CONF_DIR/php-version.conf"
+		return 1
+	}
+	echo "$PHP_VERSION" > "$CONF_DIR/php-version.conf"
+	ok "PHP version set to $PHP_VERSION"
+
+	# Earlier this left PHP stopped after a version switch.
+	if [[ $was_running == true ]]; then
+		start_php
+	fi
+}
+
+php_run() {
+	nix-portable nix-shell -p "$PHP_VERSION" --run "$*" 2>/dev/null
+}
+
+php_info() {
+	info "=== PHP Information ===\n"
+	echo -e "${YELLOW}Current version:${NC} $PHP_VERSION\n"
+	php_run "php -v; echo; echo -e 'Binary:'; command -v php; echo; echo -e 'php-fpm:'; command -v php-fpm; echo; echo -e 'Loaded ini:'; php --ini | head -5"
+	echo
+	pause
+}
+
+php_extensions() {
+	info "=== PHP Extensions ===\n"
+	echo -e "${YELLOW}Installed extensions for $PHP_VERSION:${NC}\n"
+	php_run "php -m" | column -t 2>/dev/null || php_run "php -m"
+	echo
+	pause
+}
+
+php_phpinfo() {
+	if ! service_is_running apache || ! service_is_running php; then
+		fail "Apache and PHP-FPM must both be running to view phpinfo"
+		pause
+		return 1
+	fi
+
+	local page="$WWW_DIR/phpinfo.php"
+	printf '<?php phpinfo(); ?>\n' > "$page"
+	info "phpinfo page created at $page"
+	info "URL: http://localhost:$APACHE_PORT/phpinfo.php"
+
+	if command -v xdg-open >/dev/null 2>&1; then
+		xdg-open "http://localhost:$APACHE_PORT/phpinfo.php" >/dev/null 2>&1 &
+	elif command -v open >/dev/null 2>&1; then
+		open "http://localhost:$APACHE_PORT/phpinfo.php" >/dev/null 2>&1 &
+	else
+		warn "Open http://localhost:$APACHE_PORT/phpinfo.php manually"
+	fi
+
+	echo
+	warn "phpinfo() exposes your full PHP configuration over HTTP."
+	if read -r -p "Remove $page now? [Y/n] " reply && [[ ! $reply =~ ^[Nn]$ ]]; then
+		rm -f "$page"
+		ok "phpinfo.php removed from the web root"
+	else
+		warn "phpinfo.php left in the web root - remove it before sharing this machine"
+	fi
+	pause
+}
+
+# Pick an editor, falling back through $EDITOR, common editors, then cat.
+pick_editor() {
+	if [[ -n ${EDITOR:-} ]] && command -v "${EDITOR%% *}" >/dev/null 2>&1; then
+		echo "${EDITOR%% *}"
+		return 0
+	fi
+	local candidate
+	for candidate in nano vim vi; do
+		command -v "$candidate" >/dev/null 2>&1 && { echo "$candidate"; return 0; }
+	done
+	return 1
+}
+
+php_edit_config() {
+	info "=== PHP Configuration ===\n"
+	info "PHP-FPM loads this file via -c $CONF_DIR"
+	info "Path: $CONF_DIR/php.ini\n"
+
+	echo -e "${YELLOW}Current settings:${NC}"
+	grep -v '^[[:space:]]*[;#]' "$CONF_DIR/php.ini" 2>/dev/null | grep -v '^[[:space:]]*$' | head -20 || true
+	echo -e "  ...(truncated)\n"
+
+	echo -e "${YELLOW}Options:${NC}"
+	echo "1) Edit php.ini"
+	echo "2) View full php.ini"
+	echo "3) Show effective php.ini values (php -i)"
+	echo "4) Reset to defaults"
+	echo "5) Back"
+	read -r -p "Select option: " option
+
+	case "$option" in
+		1)
+			if editor=$(pick_editor); then
+				"$editor" "$CONF_DIR/php.ini" || true
+			else
+				fail "No editor found. Set \$EDITOR and try again."
+			fi
+			;;
+		2)
+			if command -v less >/dev/null 2>&1; then
+				less "$CONF_DIR/php.ini"
+			else
+				cat "$CONF_DIR/php.ini"
+			fi
+			;;
+		3)
+			php_run "php --ini" || true
+			;;
+		4)
+			write_php_ini
+			;;
+		*)
+			return 0
+			;;
+	esac
+
+	echo -e "\n${YELLOW}Restart PHP-FPM for changes to take effect.${NC}"
+	pause
+}
+
+php_logs() {
+	info "=== PHP Logs ===\n"
+	echo "1) PHP-FPM log    ($PHP_FPM_LOG)"
+	echo "2) PHP error log  ($PHP_ERROR_LOG)"
+	echo "3) Tail PHP-FPM log (live)"
+	echo "4) Clear all PHP logs"
+	echo "5) Back"
+	read -r -p "Select option: " option
+
+	case "$option" in
+		1) show_log "$PHP_FPM_LOG" "PHP-FPM" ;;
+		2) show_log "$PHP_ERROR_LOG" "PHP error" ;;
+		3)
+			warn "Tailing $PHP_FPM_LOG (Ctrl+C to stop tailing, not to quit ApacheNest)"
+			echo
+			tail -f "$PHP_FPM_LOG" 2>/dev/null || echo "Log file not found."
+			echo
+			;;
+		4)
+			: > "$PHP_FPM_LOG" 2>/dev/null || true
+			: > "$PHP_ERROR_LOG" 2>/dev/null || true
+			ok "PHP logs cleared"
+			pause
+			;;
+		*)
+			return 0
+			;;
+	esac
+}
+
+show_log() {
+	local file=$1 label=$2
+	if [[ -f $file ]]; then
+		info "--- $label ---"
+		if command -v less >/dev/null 2>&1; then
+			less "$file"
+		else
+			cat "$file"
+		fi
+	else
+		warn "No $label log file found at $file"
+		pause
+	fi
+}
+
+php_clear_opcache() {
+	if ! service_is_running php || ! service_is_running apache; then
+		fail "Apache and PHP-FPM must both be running to clear the OPcache"
+		pause
+		return 1
+	fi
+
+	local page="$WWW_DIR/opcache_clear.php"
+	# Registered globally so the SIGINT handler can remove it if the user
+	# interrupts the request; a leftover endpoint in the web root is a risk.
+	SCRATCH_PAGE=$page
+
+	cat > "$page" <<'EOF'
+<?php
+header('Content-Type: text/plain');
+if (function_exists('opcache_reset')) {
+    echo opcache_reset() ? "OPcache cleared successfully!" : "OPcache reset returned false.";
+} else {
+    echo "OPcache is not available.";
+}
+EOF
+
+	step "Clearing OPcache..."
+	curl -fsS "http://localhost:$APACHE_PORT/opcache_clear.php" || warn "Could not reach the server"
+
+	rm -f "$page"
+	SCRATCH_PAGE=""
+	trap - SIGINT
+	trap on_interrupt SIGINT
+
+	echo
+	ok "OPcache clear attempted"
+	pause
+}
+
+php_test() {
+	info "Running PHP test...\n"
+	php_run "echo '=== PHP Syntax Check ==='; php -v; echo; echo '=== Testing PHP execution ==='; php -r 'echo \"PHP is working! Current time: \" . date(\"Y-m-d H:i:s\") . PHP_EOL;'; echo; echo '=== Common extensions ==='; php -r 'foreach ([\"pdo\",\"mysqli\",\"json\",\"mbstring\",\"curl\",\"openssl\",\"zip\",\"gd\"] as \$e) { printf(\"  %s %s\n\", extension_loaded(\$e) ? \"[OK]  \" : \"[FAIL]\", \$e); }'"
+	echo
+	pause
+}
+
+# --- MySQL ---
+
+install_mysql() {
+	nix_install_pkg "mysql" "MySQL"
+}
+
+# Idempotent, silent. Called on every start so my.cnf always reflects the
+# current paths and ports, without reprinting the setup banner.
+ensure_mysql_config() {
+	mkdir -p "$MYSQL_DIR" "$MYSQL_DIR/data"
+
+	# Always rewritten: the previous version only created my.cnf when absent,
+	# which made the "Config" menu item a permanent no-op.
+	cat > "$MYSQL_DIR/my.cnf" <<EOF
+[mysqld]
+datadir = $MYSQL_DIR/data
+socket = $MYSQL_SOCKET
+user = $(whoami)
+bind-address = 127.0.0.1
+port = $MYSQL_PORT
+skip-external-locking
+default_storage_engine = InnoDB
+innodb_file_per_table = 1
+innodb_log_file_size = 64M
+log-error = $MYSQL_LOG
+pid-file = $MYSQL_DIR/mysql.pid
+tmpdir = $MYSQL_DIR
+
+[mysqld_safe]
+log-error = $MYSQL_LOG
+pid-file = $MYSQL_DIR/mysql.pid
+
+[mysql]
+socket = $MYSQL_SOCKET
+
+[client]
+socket = $MYSQL_SOCKET
+EOF
+
+	# No empty mysql.pid: it is not a valid pid and only confuses other tooling.
+	[[ -f $MYSQL_LOG ]] || touch "$MYSQL_LOG"
+}
+
+# Verbose form, for the "Config" menu action and first-time setup only.
+config_mysql() {
+	step "Setting up MySQL..."
+	ensure_mysql_config
+	ok "MySQL config written to $MYSQL_DIR/my.cnf"
+	ok "MySQL configuration complete"
+}
+
+# 0600 defaults file, so passwords never appear in `ps` output.
+write_mysql_client_cnf() {
+	local password=${1-}
+	{
+		echo "[client]"
+		echo "user = root"
+		[[ -n $password ]] && echo "password = '$(my_cnf_escape "$password")'"
+		echo "socket = $MYSQL_SOCKET"
+	} > "$MYSQL_CLIENT_CNF"
+	chmod 600 "$MYSQL_CLIENT_CNF"
+}
+
+remove_mysql_client_cnf() {
+	rm -f "$MYSQL_CLIENT_CNF"
+}
+
+# Run a SQL script from stdin, keeping SQL out of shell strings. Errors are
+# captured and echoed only on failure.
+mysql_script() {
+	local sqlfile rc
+	sqlfile=$(mktemp)
+	cat > "$sqlfile"
+	: > "$MYSQL_CLI_LOG"
+	nix-portable nix-shell -p mysql --run \
+		"mysql --defaults-extra-file='$MYSQL_CLIENT_CNF' < '$sqlfile'" >"$MYSQL_CLI_LOG" 2>&1
+	rc=$?
+	rm -f "$sqlfile"
+	if [[ $rc -ne 0 && -s $MYSQL_CLI_LOG ]]; then
+		tail -n 10 "$MYSQL_CLI_LOG" | sed 's/^/      /'
+	fi
+	return $rc
+}
+
+# Can we log in with this password? Quiet.
+mysql_verify_login() {
+	local password=${1-}
+	write_mysql_client_cnf "$password"
+	if mysql_script <<<'SELECT 1;' >/dev/null 2>&1; then
+		remove_mysql_client_cnf
+		return 0
+	fi
+	remove_mysql_client_cnf
+	return 1
+}
+
+mysqladmin_shutdown() {
+	local attempt
+	# Try empty then default, so shutdown works on a fresh or configured account.
+	for attempt in "" "$MYSQL_DEFAULT_PASSWORD"; do
+		write_mysql_client_cnf "$attempt"
+		if nix-portable nix-shell -p mysql --run \
+			"mysqladmin --defaults-extra-file='$MYSQL_CLIENT_CNF' shutdown" >/dev/null 2>&1; then
+			remove_mysql_client_cnf
+			return 0
+		fi
+	done
+	remove_mysql_client_cnf
+	return 1
+}
+
+# Make root@localhost use password auth. MariaDB's mysql_install_db gives it the
+# unix_socket plugin, which requires the OS user to be named "root" and so fails
+# with error 1698 for anyone else; converting it needs a --skip-grant-tables
+# session first.
+mysql_bootstrap_root_password() {
+	local password=$1
+
+	if mysql_verify_login "$password"; then
+		ok "MySQL root account already accepts a password"
+		return 0
+	fi
+
+	step "Configuring the MySQL root account..."
+
+	mysqladmin_shutdown || true
+	service_stop mysql
+	rm -f "$MYSQL_DIR/mysql.pid"
+	sleep 1
+
+	run_nix mysql "mysqld_safe --defaults-file='$MYSQL_DIR/my.cnf' --skip-grant-tables >> '$MYSQL_LOG' 2>&1 &" || true
+	if ! wait_for_service mysql 90; then
+		report_start_failure "Could not start MySQL in skip-grant-tables mode"
+		[[ -s $MYSQL_LOG ]] && tail -n 10 "$MYSQL_LOG" | sed 's/^/      /'
+		return 1
+	fi
+
+	write_mysql_client_cnf ""
+	mysql_script <<-SQL
+		FLUSH PRIVILEGES;
+		ALTER USER 'root'@'localhost' IDENTIFIED VIA mysql_native_password USING PASSWORD('$(sql_escape "$password")');
+	SQL
+	local rc=$?
+	remove_mysql_client_cnf
+
+	service_stop mysql
+	rm -f "$MYSQL_DIR/mysql.pid"
+	sleep 2
+
+	if [[ $rc -ne 0 ]]; then
+		report_start_failure "Could not convert the MySQL root account to password authentication"
+		start_mysql || true
+		return 1
+	fi
+
+	# Re-entering start_mysql here cannot recurse: the data directory is already
+	# populated, so the first-init branch is not taken again.
+	if ! start_mysql; then
+		report_start_failure "MySQL root password was set, but the server would not restart"
+		return 1
+	fi
+
+	if mysql_verify_login "$password"; then
+		ok "MySQL root password set to: $password"
+		return 0
+	fi
+
+	fail "MySQL started but the root password was not accepted"
+	return 1
+}
+
+mysql_admin_password() {
+	local current=$1 new=$2
+	write_mysql_client_cnf "$current"
+	mysql_script <<-SQL
+		SET SESSION sql_mode = 'NO_BACKSLASH_ESCAPES';
+		ALTER USER 'root'@'localhost' IDENTIFIED BY '$(sql_escape "$new")';
+	SQL
+}
+
+set_mysql_initial_password() {
+	step "Setting the initial MySQL root password..."
+	# mysql_bootstrap_root_password reports what it did, including the case
+	# where the account already accepted a password.
+	if ! mysql_bootstrap_root_password "$MYSQL_DEFAULT_PASSWORD"; then
+		warn "Could not set the initial MySQL password automatically"
+		[[ -s $MYSQL_CLI_LOG ]] && {
+			echo -e "${YELLOW}--- mysql client output ---${NC}"
+			tail -n 10 "$MYSQL_CLI_LOG" | sed 's/^/      /'
+		}
+		return 1
+	fi
+}
+
+mysql_change_password() {
+	if ! service_is_running mysql; then
+		fail "MySQL is not running. Start it first."
+		pause
+		return 1
+	fi
+
+	info "Enter current password:"
+	read -r -s current_password
+	echo
+	info "Enter new password:"
+	read -r -s new_password
+	echo
+	info "Confirm new password:"
+	read -r -s confirm_password
+	echo
+
+	if [[ $new_password != "$confirm_password" ]]; then
+		fail "Passwords do not match"
+		pause
+		return 1
+	fi
+	if [[ -z $new_password ]]; then
+		fail "Password must not be empty"
+		pause
+		return 1
+	fi
+
+	step "Changing password..."
+	if mysql_admin_password "$current_password" "$new_password"; then
+		remove_mysql_client_cnf
+		ok "Password changed"
+	else
+		remove_mysql_client_cnf
+		fail "Could not change the password. Check the current password."
+	fi
+	pause
+}
+
+mysql_reset_password() {
+	danger "This stops MySQL, resets the root password to '$MYSQL_DEFAULT_PASSWORD', and restarts MySQL."
+	read -r -p "Continue? [y/N] " reply
+	[[ $reply =~ ^[Yy]$ ]] || { warn "Cancelled"; pause; return 0; }
+
+	if mysql_bootstrap_root_password "$MYSQL_DEFAULT_PASSWORD"; then
+		# The bootstrap restarts MySQL itself.
+		ok "Password reset to: $MYSQL_DEFAULT_PASSWORD"
+	else
+		fail "Could not reset the password. Restore the service with MySQL > Start."
+	fi
+	pause
+}
+
+mysql_reset_data() {
+	danger "WARNING: this deletes ALL MySQL data and reinitialises the database."
+	danger "All databases, tables and data will be permanently lost."
+	echo
+	read -r -p "Type 'RESET' to confirm: " confirm
+	[[ $confirm == "RESET" ]] || { warn "Cancelled"; pause; return 0; }
+
+	step "Stopping MySQL..."
+	service_stop mysql
+	sleep 2
+
+	step "Clearing the data directory..."
+	rm -rf "$MYSQL_DIR/data"
+	mkdir -p "$MYSQL_DIR/data"
+	ok "Data directory cleared"
+
+	step "Reinitialising the database..."
+	run_nix mysql "mysql_install_db --defaults-file='$MYSQL_DIR/my.cnf' --datadir='$MYSQL_DIR/data' --user=\$(whoami)" || {
+		report_start_failure "mysql_install_db failed"
+		pause
+		return 1
+	}
+	ok "Database reinitialised"
+
+	start_mysql
+	set_mysql_initial_password
+
+	ok "MySQL data reset complete. Default password: $MYSQL_DEFAULT_PASSWORD"
+	pause
+}
+
+mysql_data_initialized() {
+	[[ -f "$MYSQL_DIR/data/mysql/db.opt" ]]
+}
+
+start_mysql() {
+	if service_is_running mysql; then
+		warn "MySQL is already running"
+		return 0
+	fi
+
+	ensure_mysql_config
+
+	local first_init=false
+	if ! mysql_data_initialized; then
+		step "Initialising the MySQL database..."
+		run_nix mysql "mysql_install_db --defaults-file='$MYSQL_DIR/my.cnf' --datadir='$MYSQL_DIR/data' --user=\$(whoami)" || {
+			report_start_failure "mysql_install_db failed"
+			return 1
+		}
+		ok "MySQL database initialised"
+		first_init=true
+	fi
+
+	step "Starting MySQL..."
+	run_nix mysql "mysqld_safe --defaults-file='$MYSQL_DIR/my.cnf' >> '$MYSQL_LOG' 2>&1 &" || true
+
+	if ! wait_for_service mysql 180; then
+		report_start_failure "MySQL failed to start"
+		[[ -s $MYSQL_LOG ]] && { echo; tail -n 15 "$MYSQL_LOG"; }
+		return 1
+	fi
+	ok "MySQL started on 127.0.0.1:$MYSQL_PORT"
+
+	if [[ $first_init == true ]]; then
+		sleep 1
+		set_mysql_initial_password
+	fi
+	remove_mysql_client_cnf
+}
+
+stop_mysql() {
+	if ! service_is_running mysql; then
+		warn "MySQL is not running"
+		return 0
+	fi
+	step "Stopping MySQL..."
+	service_stop mysql
+	rm -f "$MYSQL_DIR/mysql.pid"
+	ok "MySQL stopped"
+}
+
+restart_mysql() {
+	stop_mysql
+	sleep 1
+	start_mysql
+}
+
+mysql_status_report() {
+	echo -e "Socket:      $MYSQL_SOCKET"
+	echo -e "Port:        127.0.0.1:$MYSQL_PORT"
+	echo -e "Initialized: $(mysql_data_initialized && echo yes || echo no)"
+}
+
+# --- MailHog ---
+
+install_mailhog() {
+	nix_install_pkg "mailhog" "MailHog"
+}
+
+# Wrapper so php.ini can point sendmail_path at a stable absolute path.
+write_sendmail_wrapper() {
+	mkdir -p "$BIN_DIR"
+	cat > "$BIN_DIR/mailhog-sendmail" <<EOF
+#!/usr/bin/env bash
+export NP_LOCATION="$INSTALL_DIR"
+export PATH="$PATH:$BIN_DIR"
+exec "$BIN_DIR/nix-portable" nix-shell -p mailhog --run "MailHog sendmail"
+EOF
+	chmod +x "$BIN_DIR/mailhog-sendmail"
+}
+
+# Idempotent and silent: ensure the layout exists on every start.
+ensure_mailhog() {
+	mkdir -p "$MAILHOG_DIR"
+	[[ -f $MAILHOG_LOG ]] || touch "$MAILHOG_LOG"
+	write_sendmail_wrapper
+}
+
+# Verbose form, for the "Config" menu action and first-time setup only.
+config_mailhog() {
+	step "Setting up MailHog..."
+	ensure_mailhog
+	ok "MailHog configuration complete"
+	info "SMTP Server: localhost:$MAIL_SMTP_PORT"
+	info "Web UI: http://localhost:$MAIL_UI_PORT"
+}
+
+setup_mailhog() {
+	install_mailhog
+	config_mailhog
+}
+
+start_mailhog() {
+	ensure_mailhog
+
+	if service_is_running mail; then
+		warn "MailHog is already running"
+		return 0
+	fi
+
+	step "Starting MailHog..."
+	run_nix mailhog "MailHog >> '$MAILHOG_LOG' 2>&1 &" || true
+
+	if wait_for_service mail 40; then
+		ok "MailHog started"
+		info "SMTP Server: localhost:$MAIL_SMTP_PORT"
+		info "Web UI: http://localhost:$MAIL_UI_PORT"
+	else
+		report_start_failure "MailHog failed to start"
+		[[ -s $MAILHOG_LOG ]] && { echo; tail -n 15 "$MAILHOG_LOG"; }
+		return 1
+	fi
+}
+
+stop_mailhog() {
+	if ! service_is_running mail; then
+		warn "MailHog is not running"
+		return 0
+	fi
+	step "Stopping MailHog..."
+	service_stop mail
+	ok "MailHog stopped"
+}
+
+restart_mailhog() {
+	stop_mailhog
+	sleep 1
+	start_mailhog
+}
+
+open_mailhog_ui() {
+	if ! service_is_running mail; then
+		fail "MailHog is not running. Start it first."
+		pause
+		return 1
+	fi
+	info "Opening the MailHog web UI..."
+	info "URL: http://localhost:$MAIL_UI_PORT"
+	if command -v xdg-open >/dev/null 2>&1; then
+		xdg-open "http://localhost:$MAIL_UI_PORT" >/dev/null 2>&1 &
+	elif command -v open >/dev/null 2>&1; then
+		open "http://localhost:$MAIL_UI_PORT" >/dev/null 2>&1 &
+	else
+		warn "Open http://localhost:$MAIL_UI_PORT manually"
+	fi
+	pause
+}
+
+config_php_mail() {
+	info "Pointing PHP's mail() at MailHog..."
+
+	if ! service_is_running mail; then
+		warn "MailHog is not running; mail() will fail until it is started."
+	fi
+
+	# php.ini is the file PHP-FPM actually loads (-c), so the mail settings
+	# belong there. The old php-mail.ini was never read by anything.
+	if ! grep -q '^sendmail_path' "$CONF_DIR/php.ini" 2>/dev/null; then
+		cat >> "$CONF_DIR/php.ini" <<EOF
+
+[mail function]
+sendmail_path = "$BIN_DIR/mailhog-sendmail"
+SMTP = localhost
+smtp_port = $MAIL_SMTP_PORT
+EOF
+		ok "Mail settings appended to $CONF_DIR/php.ini"
+	else
+		ok "Mail settings already present in $CONF_DIR/php.ini"
+	fi
+
+	if service_is_running php; then
+		warn "Restart PHP-FPM for the change to take effect (PHP > Restart)."
+	else
+		warn "Start PHP-FPM for the change to take effect."
+	fi
+	pause
+}
+
+test_email() {
+	if ! service_is_running mail; then
+		fail "MailHog is not running. Start it first."
+		pause
+		return 1
+	fi
+
+	step "Sending a test email..."
+	local body="This is a test email from ApacheNest."
+	if nix-portable nix-shell -p mailhog --run "MailHog sendmail" 2>/dev/null <<-EOF
+		Subject: Test Email from ApacheNest
+		From: test@apachenest.local
+		To: user@example.com
+
+		$body
+	EOF
+	then
+		ok "Test email sent. Check http://localhost:$MAIL_UI_PORT"
+	else
+		if command -v nc >/dev/null 2>&1; then
+			{
+				echo "EHLO localhost"
+				echo "MAIL FROM:<test@apachenest.local>"
+				echo "RCPT TO:<user@example.com>"
+				echo "DATA"
+				echo "Subject: Test Email from ApacheNest"
+				echo ""
+				echo "$body"
+				echo "."
+				echo "QUIT"
+			} | nc -w 3 localhost "$MAIL_SMTP_PORT" || fail "Could not reach MailHog on port $MAIL_SMTP_PORT"
+		else
+			fail "MailHog sendmail failed and netcat is not installed as a fallback."
+		fi
+	fi
+	pause
+}
+
+# --- Setup / orchestration ---
+
+setup_apache_php() {
+	# Only pick a default when nothing has been chosen yet; previously every
+	# setup (including Reset All) overwrote the user's version.
+	if [[ ! -f "$CONF_DIR/php-version.conf" ]]; then
+		echo "$DEFAULT_PHP_VERSION" > "$CONF_DIR/php-version.conf"
+	fi
+	PHP_VERSION=$(<"$CONF_DIR/php-version.conf")
+	install_apache
+	install_php
+}
+
+setup_apachenest() {
+	setup_nix_portable
+	setup_apache_php
+	setup_apache_config
+	config_mysql
+	install_mysql
+	setup_mailhog
+
+	# Populate the web root whether or not PHP was already installed.
+	if [[ ! -f "$WWW_DIR/index.php" ]]; then
+		printf '<?php\nphpinfo();\n' > "$WWW_DIR/index.php"
+	fi
+	ok "ApacheNest is ready"
+}
+
+start_all() {
+	local svc failed=()
+
+	for svc in apache php mysql mail; do
+		if service_is_running "$svc"; then
+			ok "$(service_label "$svc") already running"
+			continue
+		fi
+		case "$svc" in
+			apache) start_apache ;;
+			php)    start_php ;;
+			mysql)  start_mysql ;;
+			mail)   start_mailhog ;;
+		esac
+		service_is_running "$svc" || failed+=("$(service_label "$svc")")
+	done
+
+	if [[ ${#failed[@]} -gt 0 ]]; then
+		fail "Failed to start: ${failed[*]}"
+		return 1
+	fi
+	ok "All services started"
+}
+
+stop_all() {
+	stop_apache
+	stop_php
+	stop_mysql
+	stop_mailhog
+	ok "All services stopped"
+}
 
 restart_all() {
 	restart_apache
 	restart_php
 	restart_mysql
 	restart_mailhog
+	ok "All services restarted"
 }
 
-start_all(){
-	if ! pgrep -af "$CONF_DIR/httpd.conf" > /dev/null; then 
-		start_apache
-	fi
-	if ! pgrep -af "$CONF_DIR/php-fpm.conf" > /dev/null; then 
-		start_php
-	fi
-	if ! pgrep -af "mysqld" > /dev/null; then 
-		start_mysql
-	fi
-	if ! pgrep -af "MailHog" > /dev/null; then 
-		start_mailhog
-	fi
-	clear
+reset_all() {
+	danger "WARNING: this deletes ApacheNest config, state, logs and database data."
+	danger "Apache, PHP, MySQL and MailHog will be stopped first."
+	echo
+	read -r -p "Type 'RESET' to confirm: " confirm
+	[[ $confirm == "RESET" ]] || { warn "Cancelled"; pause; return 0; }
+
+	step "Stopping services..."
+	stop_all || true
+
+	step "Removing generated files..."
+	rm -rf "$CONF_DIR" "$WWW_DIR" "$APACHE_DIR" "$MYSQL_DIR" "$MAILHOG_DIR" "$SESSIONS_DIR"
+	rm -f "$PHP_FPM_LOG" "$PHP_ERROR_LOG" "$PHP_FPM_STDERR_LOG" "$INSTALL_DIR/php-fpm.pid" "$NIX_LOG"
+	ok "Generated files removed"
+
+	step "Rebuilding the initial setup..."
+	configure_env
+	setup_apachenest
+	ok "ApacheNest reset to a fresh initial setup"
+	pause
 }
 
-stop_all(){
-	stop_apache
-	stop_php
-	stop_mysql
-	stop_mailhog
-	clear
+# ===========================================================================
+# Headless status report. The fzf preview runs in a separate shell and cannot
+# see this script's functions, so it re-invokes the script instead.
+# ===========================================================================
+
+status_report() {
+	local svc=${1:-all}
+	local labels
+
+	# Accept both the lowercase service key and the capitalised menu label.
+	case "$svc" in
+		All)   svc=all ;;
+		Apache) svc=apache ;;
+		PHP|PHP-FPM) svc=php ;;
+		MySQL) svc=mysql ;;
+		Mail|MailHog) svc=mail ;;
+	esac
+
+	if [[ $svc == all ]]; then
+		labels="apache php mysql mail"
+	else
+		labels=$svc
+	fi
+
+	local s
+	for s in $labels; do
+		local log=""
+		case "$s" in
+			apache) log="$APACHE_LOG_DIR/error_log" ;;
+			php)    log="$PHP_FPM_LOG" ;;
+			mysql)  log="$MYSQL_LOG" ;;
+			mail)   log="$MAILHOG_LOG" ;;
+			*)      continue ;;
+		esac
+
+		if service_is_running "$s"; then
+			echo "$(service_label "$s") status: [ACTIVE]"
+		else
+			echo "$(service_label "$s") status: [INACTIVE]"
+		fi
+
+		if [[ $svc != all ]]; then
+			echo
+			echo "=== Recent log output ==="
+			if [[ -f $log && -s $log ]]; then
+				tail -20 "$log"
+			else
+				echo "(no log output yet)"
+			fi
+		fi
+		echo
+	done
+
+	if [[ $svc == php ]]; then
+		echo "PHP version: $PHP_VERSION"
+		echo "php.ini:    $CONF_DIR/php.ini"
+	fi
+	if [[ $svc == mail ]]; then
+		echo "SMTP: localhost:$MAIL_SMTP_PORT"
+		echo "Web UI: http://localhost:$MAIL_UI_PORT"
+	fi
 }
 
-restart(){
-	restart_apache
-	restart_php
-	restart_mysql
-	restart_mailhog
-	clear
+# --- Menus ---
+
+fzf_pick() {
+	local prompt=$1
+	shift
+	printf "%s\n" "$@" |
+		fzf --border --highlight-line --layout=reverse --prompt="$prompt > "
 }
 
-all_menu(){
-	clear
-	local ACTIONS
+# Foreground, then pause so failures are not lost to the next clear.
+menu_action() {
+	"$@"
+	echo
+	pause
+}
+
+apache_menu() {
+	local actions selected
+	local toggle=Start
+	service_is_running apache && toggle=Stop
+
 	while true; do
+		clear
 		remove_dblock
-		printf "\n${BLUE}${ROCKET} ${TITLE} ${ROCKET}${NC}\n"
+		service_is_running apache && toggle=Stop || toggle=Start
+		actions=("$toggle" "Restart" "Refresh" "Back")
 
-		ACTIONS=("Start" "Stop" "Restart" "Refresh")
-		
-		local SELECTED_ACTION=$(printf "%s\n" "${ACTIONS[@]}" | fzf --border --highlight-line --height=10% --layout=reverse --prompt="All > ")
-		[[ -z $SELECTED_ACTION ]] && break
-		case $SELECTED_ACTION in
-			"Start")
-			 	start_all & spinner ;;
-			"Stop")
-			 	stop_all & spinner ;;
-			"Restart")
-				restart_all & spinner ;;
-			"Refresh")
-				refresh_menu ;;
+		printf "\n${BLUE}${ROCKET} ${TITLE} - Apache ${ROCKET}${NC}\n"
+		selected=$(fzf_pick "Apache" "${actions[@]}") || break
+		case "$selected" in
+			Start)   menu_action start_apache ;;
+			Stop)    menu_action stop_apache ;;
+			Restart) menu_action restart_apache ;;
+			Refresh) ;;
+			Back)    break ;;
 		esac
 	done
-	clear
 }
 
-apache_menu(){
-	local ACTIONS
+php_menu() {
+	local actions selected
+
+	while true; do
+		clear
+		remove_dblock
+		local toggle=Start
+		service_is_running php && toggle=Stop
+		actions=("$toggle" "Restart" "Change Version" "PHP Info" "Extensions" "phpinfo()"
+			"Configuration" "Logs" "Clear OPcache" "Test PHP" "Refresh" "Back")
+
+		printf "\n${BLUE}${ROCKET} ${TITLE} - PHP ${ROCKET}${NC}\n"
+		echo -e "${YELLOW}Current version: ${GREEN}$PHP_VERSION${NC}\n"
+		selected=$(fzf_pick "PHP" "${actions[@]}") || break
+		case "$selected" in
+			Start)           menu_action start_php ;;
+			Stop)            menu_action stop_php ;;
+			Restart)         menu_action restart_php ;;
+			"Change Version") select_php ;;
+			"PHP Info")      php_info ;;
+			Extensions)      php_extensions ;;
+			"phpinfo()")     php_phpinfo ;;
+			Configuration)   php_edit_config ;;
+			Logs)            php_logs ;;
+			"Clear OPcache") php_clear_opcache ;;
+			"Test PHP")      php_test ;;
+			Refresh|Back)    break ;;
+		esac
+	done
+}
+
+mysql_menu() {
+	local actions selected
+	local toggle=Start
+
+	while true; do
+		clear
+		remove_dblock
+		service_is_running mysql && toggle=Stop || toggle=Start
+		actions=("$toggle" "Restart" "Change Password" "Reset Password" "Reset Data" "Config" "Refresh" "Back")
+
+		printf "\n${BLUE}${ROCKET} ${TITLE} - MySQL ${ROCKET}${NC}\n"
+		mysql_status_report
+		selected=$(fzf_pick "MySQL" "${actions[@]}") || break
+		case "$selected" in
+			Start)             menu_action start_mysql ;;
+			Stop)              menu_action stop_mysql ;;
+			Restart)           menu_action restart_mysql ;;
+			"Change Password") mysql_change_password ;;
+			"Reset Password")  mysql_reset_password ;;
+			"Reset Data")      mysql_reset_data ;;
+			Config)            config_mysql; pause ;;
+			Refresh|Back)      break ;;
+		esac
+	done
+}
+
+mail_menu() {
+	local actions selected
+	local toggle=Start
+
+	while true; do
+		clear
+		remove_dblock
+		service_is_running mail && toggle=Stop || toggle=Start
+		actions=("$toggle" "Restart" "Open Web UI" "Send Test Email" "Configure PHP" "Config" "Refresh" "Back")
+
+		printf "\n${BLUE}${ROCKET} ${TITLE} - Mail Server ${ROCKET}${NC}\n"
+		echo -e "${YELLOW}MailHog - email testing tool${NC}"
+		echo -e "${BLUE}SMTP: localhost:$MAIL_SMTP_PORT | Web UI: http://localhost:$MAIL_UI_PORT${NC}\n"
+		selected=$(fzf_pick "Mail" "${actions[@]}") || break
+		case "$selected" in
+			Start)             menu_action start_mailhog ;;
+			Stop)              menu_action stop_mailhog ;;
+			Restart)           menu_action restart_mailhog ;;
+			"Open Web UI")     open_mailhog_ui ;;
+			"Send Test Email") test_email ;;
+			"Configure PHP")   config_php_mail ;;
+			Config)            config_mailhog; pause ;;
+			Refresh|Back)      break ;;
+		esac
+	done
+}
+
+all_menu() {
+	local actions selected
+	while true; do
+		clear
+		remove_dblock
+		actions=("Start" "Stop" "Restart" "Refresh" "Back")
+
+		printf "\n${BLUE}${ROCKET} ${TITLE} ${ROCKET}${NC}\n"
+		selected=$(fzf_pick "All" "${actions[@]}") || break
+		case "$selected" in
+			Start)   menu_action start_all ;;
+			Stop)    menu_action stop_all ;;
+			Restart) menu_action restart_all ;;
+			Refresh) ;;
+			Back)    break ;;
+		esac
+	done
+}
+
+settings_menu() {
+	local actions selected
+	while true; do
+		clear
+		remove_dblock
+		actions=("Reset All" "Back")
+
+		printf "\n${BLUE}${ROCKET} ${TITLE} - Settings ${ROCKET}${NC}\n"
+		selected=$(fzf_pick "Settings" "${actions[@]}") || break
+		case "$selected" in
+			"Reset All") reset_all ;;
+			Back)        break ;;
+		esac
+	done
+}
+
+about() {
+	echo
+	# No banner here: the calling menu has already printed one.
+	printf "${YELLOW}Authors:${NC} %s\n\n" "$AUTHORS"
+	printf "  %-13s %s\n" "Install dir" "$INSTALL_DIR"
+	printf "  %-13s %s\n" "Apache" "http://localhost:$APACHE_PORT"
+	printf "  %-13s %s\n" "PHP version" "$PHP_VERSION"
+	printf "  %-13s %s\n" "php.ini" "$CONF_DIR/php.ini"
+	printf "  %-13s %s\n" "MySQL socket" "$MYSQL_SOCKET"
+	printf "  %-13s %s\n\n" "Mail UI" "http://localhost:$MAIL_UI_PORT"
+	pause
+}
+
+preview_for() {
+	local selected=$1
+	case "$selected" in
+		All)
+			"$APACHENEST_BIN" --status all 2>/dev/null || echo "(status unavailable)"
+			;;
+		Apache|PHP|MySQL|Mail)
+			"$APACHENEST_BIN" --status "$selected" 2>/dev/null || echo "(status unavailable)"
+			;;
+		*)
+			echo "Select a service to see its status and recent logs."
+			;;
+	esac
+}
+
+main_menu() {
+	local actions selected
+	actions=("All" "Apache" "PHP" "MySQL" "Mail" "Refresh" "Settings" "About" "Exit")
+
 	while true; do
 		clear
 		remove_dblock
 		printf "\n${BLUE}${ROCKET} ${TITLE} ${ROCKET}${NC}\n"
-		ACTIONS=($(if ! pgrep -af "$CONF_DIR/httpd.conf" > /dev/null; then 
-			echo Start
-		else
-			echo Stop
-		fi) "Restart" "Refresh")
-		
-		local SELECTED_ACTION=$(printf "%s\n" "${ACTIONS[@]}" | fzf --border --highlight-line --height=10% --layout=reverse --prompt="Apache > ")
-		[[ -z $SELECTED_ACTION ]] && break
-		case $SELECTED_ACTION in
-			"Start")
-			 	start_apache & spinner ;;
-			"Stop")
-			 	stop_apache & spinner ;;
-			"Restart")
-				restart_apache & spinner ;;
-			"Refresh")
-				refresh_menu ;;
+
+		selected=$(printf "%s\n" "${actions[@]}" |
+			fzf --border --highlight-line --height=12% --layout=reverse \
+				--prompt="ApacheNest > " \
+				--preview-window=80%:wrap \
+				--preview "$(declare -f preview_for service_label service_binary service_is_running); preview_for {}") || break
+
+		case "$selected" in
+			All)      all_menu ;;
+			Apache)   apache_menu ;;
+			PHP)      php_menu ;;
+			MySQL)    mysql_menu ;;
+			Mail)     mail_menu ;;
+			Refresh)  ;;
+			Settings) settings_menu ;;
+			About)    about ;;
+			Exit)     bye; return 0 ;;
 		esac
 	done
-	clear
-}
-
-php_menu(){
-	clear
-	local ACTIONS
-	while true; do
-		remove_dblock
-		printf "\n${BLUE}${ROCKET} ${TITLE} - PHP ${ROCKET}${NC}\n"
-		echo -e "${YELLOW}Current Version: ${GREEN}$PHP_VERSION${NC}\n"
-		
-		ACTIONS=($(if ! pgrep -af "$CONF_DIR/php-fpm.conf" > /dev/null; then 
-			echo Start
-		else
-			echo Stop
-		fi) "Restart" "Change Version" "PHP Info" "Extensions" "phpinfo()" "Configuration" "Logs" "Clear OPcache" "Test PHP" "Refresh")
-		
-		local SELECTED_ACTION=$(printf "%s\n" "${ACTIONS[@]}" | fzf --border --highlight-line --height=18% --layout=reverse --prompt="PHP > ")
-		[[ -z $SELECTED_ACTION ]] && break
-		case $SELECTED_ACTION in
-			"Start")
-			 	start_php & spinner ;;
-			"Stop")
-			 	stop_php & spinner ;;
-			"Restart")
-				restart_php & spinner ;;
-			"Change Version")
-				select_php ;;
-			"PHP Info")
-				php_info ;;
-			"Extensions")
-				php_extensions ;;
-			"phpinfo()")
-				php_phpinfo ;;
-			"Configuration")
-				php_edit_config ;;
-			"Logs")
-				php_logs ;;
-			"Clear OPcache")
-				php_clear_opcache ;;
-			"Test PHP")
-				php_test ;;
-			"Refresh")
-				refresh_menu ;;
-		esac
-	done
-	clear
-}
-
-restart_mysql() {
-	clear
-	stop_mysql
-	start_mysql
-}
-
-mysql_menu() {
-	clear
-	local ACTIONS
-	echo -e "\n${BLUE}${ROCKET} ${TITLE} ${ROCKET}${NC}"
-	while true; do
-		remove_dblock
-		ACTIONS=("Start" "Stop" "Restart" "Change Password" "Reset Password" "Reset Data" "Config" "Refresh")
-		
-		local SELECTED_ACTION=$(printf "%s\n" "${ACTIONS[@]}" | fzf --border --highlight-line --height=15% --layout=reverse --prompt="MySQL > ")
-		[[ -z $SELECTED_ACTION ]] && break
-		case $SELECTED_ACTION in
-			"Start")
-			 	start_mysql & spinner ;;
-			"Stop")
-			 	stop_mysql & spinner ;;
-			"Restart")
-				restart_mysql & spinner ;;
-			"Change Password")
-				mysql_change_password ;;
-			"Reset Password")
-				mysql_reset_password ;;
-			"Reset Data")
-				mysql_reset_data ;;
-			"Config")
-				config_mysql ;;
-			"Refresh")
-				refresh_menu ;;
-		esac
-	done
-	clear
-}
-
-mail_menu() {
-	clear
-	local ACTIONS
-	echo -e "\n${BLUE}${ROCKET} ${TITLE} - Mail Server ${ROCKET}${NC}"
-	echo -e "${YELLOW}MailHog - Email Testing Tool${NC}"
-	echo -e "${BLUE}SMTP: localhost:1025 | Web UI: http://localhost:8025${NC}\n"
-	while true; do
-		remove_dblock
-		ACTIONS=($(if ! pgrep -af "MailHog" > /dev/null; then 
-			echo Start
-		else
-			echo Stop
-		fi) "Restart" "Open Web UI" "Send Test Email" "Configure PHP" "Config" "Refresh")
-		
-		local SELECTED_ACTION=$(printf "%s\n" "${ACTIONS[@]}" | fzf --border --highlight-line --height=15% --layout=reverse --prompt="Mail > ")
-		[[ -z $SELECTED_ACTION ]] && break
-		case $SELECTED_ACTION in
-			"Start")
-			 	start_mailhog & spinner ;;
-			"Stop")
-			 	stop_mailhog & spinner ;;
-			"Restart")
-				restart_mailhog & spinner ;;
-			"Open Web UI")
-				open_mailhog_ui ;;
-			"Send Test Email")
-				test_email ;;
-			"Configure PHP")
-				config_php_mail ;;
-			"Config")
-				config_mailhog ;;
-			"Refresh")
-				refresh_menu ;;
-		esac
-	done
-	clear
-}
-
-refresh_menu() {
-	clear
-}
-
-main_menu(){
-	clear
-	local ACTIONS
-	ACTIONS=("All" "Apache" "PHP" "MySQL" "Mail" "Refresh" "Settings" "About" "Exit")
-	while true; do
-		remove_dblock
-		printf "\n${BLUE}${ROCKET} ${TITLE} ${ROCKET}${NC}\n"
-		local SELECTED_ACTION=$(printf "%s\n" "${ACTIONS[@]}" | fzf --border --highlight-line --height=12% --layout=reverse \
-		--preview-window=80%:wrap --preview='
-		SELECTED={}
-		if [[ $SELECTED == "All" ]]; then
-			echo -e "Apache status: \t'$(if ! pgrep -af "$CONF_DIR/httpd.conf" > /dev/null; then 
-				echo 🟥Inactive 
-			else
-				echo 🟩Active 
-			fi)'"
-			echo -e "PHP status: \t'$(if ! pgrep -af "$CONF_DIR/php-fpm.conf" > /dev/null; then 
-				echo 🟥Inactive 
-			else
-				echo 🟩Active 
-			fi)'"
-			echo -e "MySQL status: \t'$(if ! pgrep -af "mysqld" > /dev/null; then 
-				echo 🟥Inactive 
-			else
-				echo 🟩Active 
-			fi)'"
-			echo -e "Mail status: \t'$(if ! pgrep -af "MailHog" > /dev/null; then 
-				echo 🟥Inactive 
-			else
-				echo 🟩Active 
-			fi)'"
-		fi
-		if [[ $SELECTED == "Apache" ]]; then
-			echo "Status: '$(if ! pgrep -af "$CONF_DIR/httpd.conf" > /dev/null; then 
-				echo 🟥Inactive 
-			else
-				echo 🟩Active 
-			fi)'"
-		  nix-portable nix-shell -p apacheHttpd --run "httpd -v" 2>/dev/null
-		  echo -e "\n===Logs===\n"
-		  [[ -f '$INSTALL_DIR'/apache/logs/error_log ]] && cat '$INSTALL_DIR'/apache/logs/error_log
-		fi
-		if [[ $SELECTED == "PHP" ]]; then
-			echo "Status: '$(if ! pgrep -af "$CONF_DIR/php-fpm.conf" > /dev/null; then 
-				echo 🟥Inactive 
-			else
-				echo 🟩Active 
-			fi)'"
-		  nix-portable nix-shell -p '$PHP_VERSION' --run "php -v" 2>/dev/null
-		  echo -e "\n===Logs===\n"
-		  [[ -f '$INSTALL_DIR'/php-fpm.log ]] && cat '$INSTALL_DIR'/php-fpm.log
-		fi
-		if [[ $SELECTED == "MySQL" ]]; then
-			echo "Status: '$(if ! pgrep -af "mysqld" > /dev/null; then 
-				echo 🟥Inactive 
-			else
-				echo 🟩Active 
-			fi)'"
-		  nix-portable nix-shell -p mysql --run "mysql --version" 2>/dev/null
-		  echo -e "\n===Logs===\n"
-		  [[ -f '$INSTALL_DIR'/mysql/mysql.log ]] && cat '$INSTALL_DIR'/mysql/mysql.log
-		fi
-		if [[ $SELECTED == "Mail" ]]; then
-			echo "Status: '$(if ! pgrep -af "MailHog" > /dev/null; then 
-				echo 🟥Inactive 
-			else
-				echo 🟩Active 
-			fi)'"
-			echo -e "\nMailHog - Email Testing Tool"
-			echo -e "SMTP Server: localhost:1025"
-			echo -e "Web UI: http://localhost:8025"
-			echo -e "\n===Logs===\n"
-			[[ -f '$INSTALL_DIR'/mailhog/mailhog.log ]] && tail -20 '$INSTALL_DIR'/mailhog/mailhog.log
-		fi
-		')
-		[[ -z $SELECTED_ACTION ]] && break
-		case $SELECTED_ACTION in
-			"All")
-				all_menu ;;
-			"Apache")
-			 	apache_menu ;;
-			"PHP")
-			 	php_menu ;;
-			"MySQL")
-				mysql_menu ;;
-			"Mail")
-				mail_menu ;;
-			"Refresh")
-				refresh_menu ;;
-			"Settings")
-				echo Settings ;;
-			"About")
-				about ;;
-			"Exit")
-				bye ;;
-		esac
-	done
-	clear
-}
-
-about() {
-	echo -e "\n${BLUE}${ROCKET} ${TITLE} ${ROCKET}${NC}"
-	echo -e "${YELLOW}Authors: ${GREEN} ${AUTHORS} ${NC}"
-
-	read -n 1 -s
-	clear
 }
 
 bye() {
-	echo -e "\nBye! ${SUCCESS} ${GREEN}Thank you for using ApacheNest!${NC}\n"
-	exit 0
+	echo
+	info "Bye! ${SUCCESS} ${GREEN}Thank you for using ApacheNest!${NC}"
+	echo
 }
 
-trap bye SIGINT
+# Ctrl+C returns to the menu instead of exiting; use the "Exit" item to quit.
+on_interrupt() {
+	printf '\n'
+	# Remove any scratch file an interrupted action left in the web root.
+	if [[ -n ${SCRATCH_PAGE:-} ]]; then
+		rm -f "$SCRATCH_PAGE"
+		SCRATCH_PAGE=""
+	fi
+}
+
+trap on_interrupt SIGINT
+
+# --- Entry point ---
 
 configure_env
-[[ ! -d $INSTALL_DIR ]] && setup_apachenest
+
+if [[ ${1:-} == "--status" ]]; then
+	status_report "${2:-all}"
+	exit 0
+fi
+
+require_commands
+
+if [[ ! -d $INSTALL_DIR ]]; then
+	setup_apachenest
+fi
+
 remove_dblock
 main_menu
